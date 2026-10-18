@@ -478,6 +478,7 @@
     "Google AI Studio API Key": "Google AI Studio API 密钥",
     "Google Model": "Google 模型",
     "Google Vertex AI Configuration": "Google Vertex AI 配置",
+    "For Gemini 4 Argon, set Region to global and enter your Project ID or the project number from the error message.": "使用 Gemini 4 Argon 时，请将区域设为 global，并填写 Project ID 或错误信息中的项目编号。",
     "Authentication Mode": "验证模式：",
     "Express Mode (API Key)": "快速模式（API 密钥）",
     "Full Version (Service Account)": "完整版本（Service Account）",
