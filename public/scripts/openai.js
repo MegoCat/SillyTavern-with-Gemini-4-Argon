@@ -437,10 +437,10 @@ const default_settings = {
     personality_format: default_personality_format,
     sort_models: 'alphabetically',
     group_models: false,
-    openai_model: 'gpt-5.6-terra',
+    openai_model: 'gpt-6-sol',
     claude_model: 'claude-sonnet-5',
-    google_model: 'gemini-3.7-flash',
-    vertexai_model: 'gemini-3.7-flash',
+    google_model: 'gemini-3.8-flash',
+    vertexai_model: 'gemini-3.8-flash',
     ai21_model: 'jamba-large',
     mistralai_model: 'mistral-large-latest',
     cohere_model: 'command-r-plus',
@@ -2621,7 +2621,7 @@ function getReasoningEffort(settings = null, model = null) {
                 }
 
                 if ([chat_completion_sources.OPENAI, chat_completion_sources.AZURE_OPENAI].includes(settings.chat_completion_source)) {
-                    if (/^gpt-5\.(4|5|6)/.test(model)) {
+                    if (/^(?:gpt-5\.(?:4|5|6)|gpt-6-(?:sol|luna))/.test(model)) {
                         return 'none';
                     }
                     if (/^gpt-5/.test(model)) {
@@ -2632,7 +2632,7 @@ function getReasoningEffort(settings = null, model = null) {
                 return reasoning_effort_types.low;
             case reasoning_effort_types.max:
                 if ([chat_completion_sources.OPENAI, chat_completion_sources.AZURE_OPENAI].includes(settings.chat_completion_source)
-                    && /^gpt-6-astra/.test(model)) {
+                    && /^gpt-6-/.test(model)) {
                     return reasoning_effort_types.max;
                 }
                 if ([chat_completion_sources.OPENAI, chat_completion_sources.AZURE_OPENAI].includes(settings.chat_completion_source)
@@ -3094,13 +3094,15 @@ export async function createGenerationParameters(settings, model, type, messages
         }
     }
 
-    if (gptSources.includes(settings.chat_completion_source) && /gpt-6-astra/.test(model)) {
+    if (gptSources.includes(settings.chat_completion_source) && /gpt-6-/.test(model)) {
         generate_data.max_completion_tokens = generate_data.max_tokens;
         delete generate_data.max_tokens;
-        delete generate_data.temperature;
-        delete generate_data.top_p;
-        delete generate_data.logprobs;
-        delete generate_data.top_logprobs;
+        if (model.includes('gpt-6-astra') || generate_data.reasoning_effort !== 'none') {
+            delete generate_data.temperature;
+            delete generate_data.top_p;
+            delete generate_data.logprobs;
+            delete generate_data.top_logprobs;
+        }
     }
 
     // Claude Fable / Claude 5 models removed sampling parameters and reject them with HTTP 400,
@@ -5092,7 +5094,7 @@ function getMaxContextOpenAI(value) {
 
     /** @type {[RegExp, number][]} */
     const contextMap = [
-        [/^gpt-6-astra/, max_1050k],
+        [/^gpt-6-/, max_1050k],
         [/^gpt-5\.6/, max_1050k],
         [/^gpt-5\.[45]/, max_1mil],
         [/^gpt-5/, max_400k],
@@ -5141,6 +5143,7 @@ function getGeminiMaxContext(model, isUnlocked) {
 
     /** @type {[RegExp, number][]} */
     const contextMap = [
+        [/gemini-4-argon/, max_1mil],
         [/gemini-2\.5-flash-image/, max_32k],
         [/gemini-3\.1-flash-image/, max_128k],
         [/gemini-3-pro-image/, max_64k],
@@ -5526,6 +5529,9 @@ async function onModelChange() {
     if ($(this).is('#model_vertexai_select')) {
         console.log('Vertex AI model changed to', value);
         oai_settings.vertexai_model = value;
+        if (value === 'gemini-4-argon' && oai_settings.vertexai_region === default_settings.vertexai_region) {
+            $('#vertexai_region').val('global').trigger('input');
+        }
     }
 
     if ($(this).is('#model_mistralai_select')) {
@@ -6242,6 +6248,8 @@ export function isImageInliningSupported() {
         'gpt-4.5-preview',
         'gpt-4o',
         'gpt-6-astra',
+        'gpt-6-sol',
+        'gpt-6-luna',
         'gpt-5',
         'o1',
         'o3',
@@ -6261,6 +6269,7 @@ export function isImageInliningSupported() {
         'gemini-2.0',
         'gemini-2.5',
         'gemini-3',
+        'gemini-4-argon',
         'gemini-exp-1206',
         'learnlm',
         'gemini-robotics',
@@ -6378,6 +6387,7 @@ export function isVideoInliningSupported() {
         'gemini-2.5',
         'gemini-exp-1206',
         'gemini-3',
+        'gemini-4-argon',
         'gemma-4',
         // Z.AI (GLM)
         'glm-4.5v',
@@ -6416,6 +6426,7 @@ export function isAudioInliningSupported() {
         'gemini-2.0',
         'gemini-2.5',
         'gemini-3',
+        'gemini-4-argon',
         'gemini-exp-1206',
         'gpt-4o-audio',
         'gpt-4o-realtime',

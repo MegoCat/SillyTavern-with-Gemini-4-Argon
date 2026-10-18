@@ -250,7 +250,7 @@ async function sendClaudeRequest(request, response) {
         const convertedPrompt = convertClaudeMessages(request.body.messages, request.body.assistant_prefill, useSystemPrompt, useTools, getPromptNames(request));
         // Unanchored to also match prefixed ids passed through proxies, e.g. 'anthropic/claude-fable-5'
         const isFableModel = /claude-fable/.test(request.body.model);
-        const isFable51Model = /claude-fable-5-1/.test(request.body.model);
+        const useNativeJsonOutput = /claude-(fable-5-1|opus-5-5)/.test(request.body.model);
         const isClaude5Model = /claude-(opus-5|sonnet-5)/.test(request.body.model);
         const useThinking = /^claude-(3-7|opus-4|sonnet-4|haiku-4-5|opus-4-5|opus-4-6|sonnet-4-6|opus-4-7)/.test(request.body.model) || isFableModel || isClaude5Model;
         const useWebSearch = (/^claude-(3-5|3-7|opus-4|sonnet-4|haiku-4-5|opus-4-5|opus-4-6|sonnet-4-6|opus-4-7)/.test(request.body.model) || isFableModel || isClaude5Model) && Boolean(request.body.enable_web_search);
@@ -299,9 +299,9 @@ async function sendClaudeRequest(request, response) {
             }
         }
 
-        // Fable 5.1 rejects forced tools, but supports native JSON outputs.
+        // Fable 5.1 and Opus 5.5 reject forced tools, but support native JSON outputs.
         if (request.body.json_schema) {
-            if (isFable51Model) {
+            if (useNativeJsonOutput) {
                 requestBody.output_config = {
                     format: {
                         type: 'json_schema',
@@ -486,6 +486,7 @@ async function sendMakerSuiteRequest(request, response) {
     }
 
     const model = String(request.body.model);
+    const isGemini4Argon = /^gemini-4-argon(?:-|$)/.test(model);
     const stream = Boolean(request.body.stream);
     const enableWebSearch = Boolean(request.body.enable_web_search);
     const requestImages = Boolean(request.body.request_images);
@@ -523,10 +524,10 @@ async function sendMakerSuiteRequest(request, response) {
             'gemini-3.1-flash-image',
         ];
 
-        const isThinkingConfigModel = m => (/^gemini-2.5-(flash|pro)/.test(m) && !/-image(-preview)?$/.test(m)) || (/^gemini-3[.\d]*-(flash|pro)/.test(m));
+        const isThinkingConfigModel = m => (/^gemini-2.5-(flash|pro)/.test(m) && !/-image(-preview)?$/.test(m)) || (/^gemini-3[.\d]*-(flash|pro)/.test(m)) || isGemini4Argon;
         const isImageSizeModel = m => /^gemini-3/.test(m);
         // https://ai.google.dev/gemini-api/docs/latest-model#api-changes-and-parameter-updates
-        const noSamplingModel = /gemini-3\.[67]-flash|gemini-3\.5-flash-lite/.test(model);
+        const noSamplingModel = /gemini-3\.[678]-flash|gemini-3\.5-flash-lite/.test(model) || isGemini4Argon;
 
         const noSearchModels = [
             'gemini-2.0-flash-lite',
@@ -688,7 +689,7 @@ async function sendMakerSuiteRequest(request, response) {
             if (authType === 'express') {
                 // For Express mode (API key authentication), use the key parameter
                 const keyParam = authHeader.replace('Bearer ', '');
-                const region = request.body.vertexai_region || 'us-central1';
+                const region = request.body.vertexai_region || (isGemini4Argon ? 'global' : 'us-central1');
                 const projectId = request.body.vertexai_express_project_id;
                 const baseUrl = region === 'global'
                     ? 'https://aiplatform.googleapis.com'
@@ -713,7 +714,7 @@ async function sendMakerSuiteRequest(request, response) {
                     console.error('Failed to extract project ID from Service Account JSON:', error);
                     return response.status(400).send({ error: true });
                 }
-                const region = request.body.vertexai_region || 'us-central1';
+                const region = request.body.vertexai_region || (isGemini4Argon ? 'global' : 'us-central1');
                 // Handle global region differently - no region prefix in hostname
                 if (region === 'global') {
                     url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${responseType}${stream ? '?alt=sse' : ''}`;
