@@ -157,6 +157,15 @@ describe('calculateGoogleBudgetTokens', () => {
         expect(mod.calculateGoogleBudgetTokens(8192, 'medium', 'gpt-4')).toBeNull();
     });
 
+    for (const [effort, level] of [
+        ['auto', null], ['min', 'low'], ['low', 'low'],
+        ['medium', 'medium'], ['high', 'high'], ['max', 'high'],
+    ]) {
+        test(`maps Gemini 4 Argon reasoning effort ${effort} to ${level}`, () => {
+            expect(mod.calculateGoogleBudgetTokens(8192, effort, 'gemini-4-argon')).toBe(level);
+        });
+    }
+
     describe('gemini-3 flash', () => {
         test('auto returns null', () => expect(mod.calculateGoogleBudgetTokens(8192, 'auto', 'gemini-3.5-flash')).toBeNull());
         test('min returns minimal', () => expect(mod.calculateGoogleBudgetTokens(8192, 'min', 'gemini-3.5-flash')).toBe('minimal'));
@@ -1069,7 +1078,7 @@ describe('convertGooglePrompt', () => {
         expect(result.contents.filter(c => c.role === 'user')).toHaveLength(1);
     });
 
-    for (const model of ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']) {
+    for (const model of ['gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']) {
         test(`merges a trailing prefill into the user turn on ${model}`, () => {
             const messages = [
                 { role: 'user', content: 'Hi' },
@@ -1090,6 +1099,29 @@ describe('convertGooglePrompt', () => {
         ];
         const result = mod.convertGooglePrompt(messages, 'gemini-3.6-flash', false, names);
         expect(result.contents.map(c => c.role)).toEqual(['user', 'model', 'user']);
+    });
+
+    test('preserves Gemini 4 Argon thought signatures in conversation history', () => {
+        const messages = [
+            { role: 'user', content: 'Hi' },
+            { role: 'assistant', content: 'Hello', signature: 'stored-signature' },
+            { role: 'user', content: 'Continue' },
+        ];
+        const result = mod.convertGooglePrompt(messages, 'gemini-4-argon', false, names);
+        expect(result.contents[1].parts[0]).toEqual({ text: 'Hello', thoughtSignature: 'stored-signature' });
+    });
+
+    test('adds the Gemini 4 Argon signature fallback for unsigned function calls', () => {
+        const messages = [
+            { role: 'user', content: 'Search' },
+            { role: 'assistant', tool_calls: [{ id: 'tc1', function: { name: 'search', arguments: '{}' } }] },
+            { role: 'tool', tool_call_id: 'tc1', content: 'Results' },
+        ];
+        const result = mod.convertGooglePrompt(messages, 'gemini-4-argon', false, names);
+        expect(result.contents[1].parts[0]).toEqual({
+            functionCall: { name: 'search', args: {} },
+            thoughtSignature: 'skip_thought_signature_validator',
+        });
     });
 
     test('converts image_url to inlineData', () => {
