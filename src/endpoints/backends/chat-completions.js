@@ -686,10 +686,14 @@ async function sendMakerSuiteRequest(request, response) {
         };
 
         if (useVertexAi) {
+            let region = request.body.vertexai_region || 'us-central1';
+            if (isGemini4Argon && region === 'us-central1') {
+                region = 'global';
+            }
+
             if (authType === 'express') {
                 // For Express mode (API key authentication), use the key parameter
                 const keyParam = authHeader.replace('Bearer ', '');
-                const region = request.body.vertexai_region || (isGemini4Argon ? 'global' : 'us-central1');
                 const projectId = request.body.vertexai_express_project_id;
                 const baseUrl = region === 'global'
                     ? 'https://aiplatform.googleapis.com'
@@ -714,7 +718,6 @@ async function sendMakerSuiteRequest(request, response) {
                     console.error('Failed to extract project ID from Service Account JSON:', error);
                     return response.status(400).send({ error: true });
                 }
-                const region = request.body.vertexai_region || (isGemini4Argon ? 'global' : 'us-central1');
                 // Handle global region differently - no region prefix in hostname
                 if (region === 'global') {
                     url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${responseType}${stream ? '?alt=sse' : ''}`;

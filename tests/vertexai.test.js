@@ -89,6 +89,26 @@ describe('Vertex AI Express Gemini 4 Argon', () => {
         expect(new URL(fetchMock.mock.calls[0][0]).pathname).toBe('/v1/projects/test-project/locations/global/publishers/google/models/gemini-4-argon:generateContent');
     });
 
+    test.each([
+        [false, undefined], [true, undefined],
+        [false, 'test-project'], [true, 'test-project'],
+    ])('routes saved us-central1 to global with stream=%s and project=%s', async (stream, projectId) => {
+        const response = await generate({ stream, vertexai_region: 'us-central1', vertexai_express_project_id: projectId });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain('Hello');
+        const requestUrl = new URL(fetchMock.mock.calls[0][0]);
+        expect(requestUrl.origin).toBe('https://aiplatform.googleapis.com');
+        const projectPath = projectId ? `/projects/${projectId}/locations/global` : '';
+        expect(requestUrl.pathname).toBe(`/v1${projectPath}/publishers/google/models/gemini-4-argon:${stream ? 'streamGenerateContent' : 'generateContent'}`);
+    });
+
+    test.each(['us', 'eu'])('preserves the explicit %s location', async (region) => {
+        const response = await generate({ vertexai_region: region, vertexai_express_project_id: 'test-project' });
+        expect(response.status).toBe(200);
+        await response.text();
+        expect(new URL(fetchMock.mock.calls[0][0]).pathname).toBe(`/v1/projects/test-project/locations/${region}/publishers/google/models/gemini-4-argon:generateContent`);
+    });
+
     test('keeps legacy model sampling and default region', async () => {
         const response = await generate({ model: 'gemini-2.5-pro', reasoning_effort: 'medium' });
         expect(response.status).toBe(200);
