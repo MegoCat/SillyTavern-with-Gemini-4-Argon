@@ -3410,13 +3410,12 @@
                                         <input id="vertexai_express_project_id" name="vertexai_express_project_id" class="text_pole flex1" value="" type="text" autocomplete="off" placeholder="Enter your Project ID">
                                     </div>
                                     <div class="toggle-description justifyLeft marginBot5">
-                                        <small data-i18n="Project ID is required when selecting regions other than the default (us-central1). You can find this in a model 404 error message.">
-                                            `Project ID` is only required when selecting regions other than the default (us-central1).<br>
-                                            You can find this in a model 404 error message.
+                                        <small data-i18n="Project ID is optional for the global Express mode endpoint. If a model access error identifies a project, enter its Project ID or project number.">
+                                            Project ID is optional for the global Express mode endpoint. If a model access error identifies a project, enter its Project ID or project number.
                                         </small>
                                         <br>
-                                        <small data-i18n="For Gemini 4 Argon, set Region to global and enter your Project ID or the project number from the error message.">
-                                            For Gemini 4 Argon, set Region to global and enter your Project ID or the project number from the error message.
+                                        <small data-i18n="For Gemini 4 Argon and Carbon, set Region to global.">
+                                            For Gemini 4 Argon and Carbon, set Region to global.
                                         </small>
                                     </div>
                                 </div>
@@ -3493,6 +3492,7 @@
                                     <!-- data-mode="full" is for models that require a service account -->
                                     <optgroup label="Gemini 4">
                                         <option value="gemini-4-argon">gemini-4-argon</option>
+                                        <option value="gemini-4-carbon">gemini-4-carbon</option>
                                     </optgroup>
                                     <optgroup label="Gemini 3.8">
                                         <option value="gemini-3.8-flash">gemini-3.8-flash</option>

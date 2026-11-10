@@ -13,7 +13,7 @@ jest.unstable_mockModule('../src/endpoints/secrets.js', () => ({
     readSecret: jest.fn(() => 'vertex-test-key'),
 }));
 
-describe('Vertex AI Express Gemini 4 Argon', () => {
+describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (model) => {
     let server;
     let baseUrl;
 
@@ -54,7 +54,7 @@ describe('Vertex AI Express Gemini 4 Argon', () => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_completion_source: 'vertexai', vertexai_auth_mode: 'express',
-                model: 'gemini-4-argon', messages: [{ role: 'user', content: 'Hi' }],
+                model, messages: [{ role: 'user', content: 'Hi' }],
                 max_tokens: 8192, temperature: 0.7, top_p: 0.9, top_k: 40,
                 include_reasoning: true, ...overrides,
             }),
@@ -62,8 +62,8 @@ describe('Vertex AI Express Gemini 4 Argon', () => {
     }
 
     test.each([
-        [false, 'auto', null], [false, 'min', 'low'],
-        [true, 'medium', 'medium'], [true, 'max', 'high'],
+        [false, 'auto', null], [false, 'min', 'low'], [false, 'low', 'low'],
+        [true, 'medium', 'medium'], [true, 'high', 'high'], [true, 'max', 'high'],
     ])('sends thinking levels with stream=%s and effort=%s', async (stream, effort, level) => {
         const response = await generate({ stream, reasoning_effort: effort });
         expect(response.status).toBe(200);
@@ -72,10 +72,11 @@ describe('Vertex AI Express Gemini 4 Argon', () => {
         const [url, options] = fetchMock.mock.calls[0];
         const requestUrl = new URL(url);
         expect(requestUrl.origin).toBe('https://aiplatform.googleapis.com');
-        expect(requestUrl.pathname).toBe(`/v1/publishers/google/models/gemini-4-argon:${stream ? 'streamGenerateContent' : 'generateContent'}`);
+        expect(requestUrl.pathname).toBe(`/v1/publishers/google/models/${model}:${stream ? 'streamGenerateContent' : 'generateContent'}`);
         expect(requestUrl.searchParams.get('key')).toBe('vertex-test-key');
         expect(requestUrl.searchParams.get('alt')).toBe(stream ? 'sse' : null);
         const { generationConfig } = JSON.parse(options.body);
+        expect(generationConfig.maxOutputTokens).toBe(8192);
         expect(generationConfig.thinkingConfig).toEqual({ includeThoughts: true, ...(level ? { thinkingLevel: level } : {}) });
         for (const field of ['temperature', 'topP', 'topK', 'candidateCount']) {
             expect(generationConfig).not.toHaveProperty(field);
@@ -86,7 +87,7 @@ describe('Vertex AI Express Gemini 4 Argon', () => {
         const response = await generate({ vertexai_express_project_id: 'test-project', vertexai_region: 'global' });
         expect(response.status).toBe(200);
         await response.text();
-        expect(new URL(fetchMock.mock.calls[0][0]).pathname).toBe('/v1/projects/test-project/locations/global/publishers/google/models/gemini-4-argon:generateContent');
+        expect(new URL(fetchMock.mock.calls[0][0]).pathname).toBe(`/v1/projects/test-project/locations/global/publishers/google/models/${model}:generateContent`);
     });
 
     test.each([
@@ -99,14 +100,36 @@ describe('Vertex AI Express Gemini 4 Argon', () => {
         const requestUrl = new URL(fetchMock.mock.calls[0][0]);
         expect(requestUrl.origin).toBe('https://aiplatform.googleapis.com');
         const projectPath = projectId ? `/projects/${projectId}/locations/global` : '';
-        expect(requestUrl.pathname).toBe(`/v1${projectPath}/publishers/google/models/gemini-4-argon:${stream ? 'streamGenerateContent' : 'generateContent'}`);
+        expect(requestUrl.pathname).toBe(`/v1${projectPath}/publishers/google/models/${model}:${stream ? 'streamGenerateContent' : 'generateContent'}`);
     });
 
     test.each(['us', 'eu'])('preserves the explicit %s location', async (region) => {
         const response = await generate({ vertexai_region: region, vertexai_express_project_id: 'test-project' });
         expect(response.status).toBe(200);
         await response.text();
-        expect(new URL(fetchMock.mock.calls[0][0]).pathname).toBe(`/v1/projects/test-project/locations/${region}/publishers/google/models/gemini-4-argon:generateContent`);
+        expect(new URL(fetchMock.mock.calls[0][0]).pathname).toBe(`/v1/projects/test-project/locations/${region}/publishers/google/models/${model}:generateContent`);
+    });
+
+    test.each([
+        [false, 100000, 32768], [true, 100000, 65536],
+        [false, undefined, undefined], [true, undefined, undefined],
+    ])('respects single-request output limits with stream=%s and max_tokens=%s', async (stream, maxTokens, expected) => {
+        const response = await generate({ stream, max_tokens: maxTokens });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain('Hello');
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body).generationConfig.maxOutputTokens).toBe(expected);
+    });
+
+    test('preserves upstream model-access error details', async () => {
+        const error = { code: 404, status: 'NOT_FOUND', message: `Publisher model ${model} is not available for this project.` };
+        fetchMock.mockResolvedValueOnce({
+            ok: false, status: 404, statusText: 'Not Found',
+            text: async () => JSON.stringify({ error }),
+        });
+        const response = await generate();
+        expect(response.ok).toBe(false);
+        expect(await response.json()).toEqual({ error });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     test('keeps legacy model sampling and default region', async () => {
