@@ -486,7 +486,7 @@ async function sendMakerSuiteRequest(request, response) {
     }
 
     const model = String(request.body.model);
-    const isGemini4 = /^gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+    const isGemini4Argon = /^gemini-4-argon(?:-|$)/.test(model);
     const stream = Boolean(request.body.stream);
     const enableWebSearch = Boolean(request.body.enable_web_search);
     const requestImages = Boolean(request.body.request_images);
@@ -512,11 +512,6 @@ async function sendMakerSuiteRequest(request, response) {
         seed: request.body.seed,
     };
 
-    // Gemini 4 requires continuation handling beyond its single-request output limits.
-    if (isGemini4 && Number.isFinite(generationConfig.maxOutputTokens)) {
-        generationConfig.maxOutputTokens = Math.min(generationConfig.maxOutputTokens, stream ? 65536 : 32768);
-    }
-
     function getGeminiBody() {
         // #region UGLY MODEL LISTS AREA
         const imageGenerationModels = [
@@ -529,10 +524,10 @@ async function sendMakerSuiteRequest(request, response) {
             'gemini-3.1-flash-image',
         ];
 
-        const isThinkingConfigModel = m => (/^gemini-2.5-(flash|pro)/.test(m) && !/-image(-preview)?$/.test(m)) || (/^gemini-3[.\d]*-(flash|pro)/.test(m)) || isGemini4;
+        const isThinkingConfigModel = m => (/^gemini-2.5-(flash|pro)/.test(m) && !/-image(-preview)?$/.test(m)) || (/^gemini-3[.\d]*-(flash|pro)/.test(m)) || isGemini4Argon;
         const isImageSizeModel = m => /^gemini-3/.test(m);
         // https://ai.google.dev/gemini-api/docs/latest-model#api-changes-and-parameter-updates
-        const noSamplingModel = /gemini-3\.[678]-flash|gemini-3\.5-flash-lite/.test(model) || isGemini4;
+        const noSamplingModel = /gemini-3\.[678]-flash|gemini-3\.5-flash-lite/.test(model) || isGemini4Argon;
 
         const noSearchModels = [
             'gemini-2.0-flash-lite',
@@ -692,7 +687,7 @@ async function sendMakerSuiteRequest(request, response) {
 
         if (useVertexAi) {
             let region = request.body.vertexai_region || 'us-central1';
-            if (isGemini4 && region === 'us-central1') {
+            if (isGemini4Argon && region === 'us-central1') {
                 region = 'global';
             }
 

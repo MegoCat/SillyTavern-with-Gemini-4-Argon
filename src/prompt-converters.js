@@ -454,7 +454,7 @@ export function convertGooglePrompt(messages, model, useSysPrompt, names) {
     const toolNameMap = {};
 
     // https://ai.google.dev/gemini-api/docs/latest-model#prefilled-model-turn-validation
-    const noPrefillModel = /gemini-3\.[678]-flash|gemini-3\.5-flash-lite|gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+    const noPrefillModel = /gemini-3\.[678]-flash|gemini-3\.5-flash-lite|gemini-4-argon/.test(model);
 
     const contents = [];
     messages.forEach((message, index) => {
@@ -1264,7 +1264,7 @@ export function calculateGoogleBudgetTokens(maxTokens, reasoningEffort, model) {
 
     function getThinkingLevel() {
         // https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
-        const noMinimalThinking = /gemini-3\.[78]-flash|gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+        const noMinimalThinking = /gemini-3\.[78]-flash|gemini-4-argon/.test(model);
         switch (reasoningEffort) {
             case REASONING_EFFORT.auto:
                 return null;
@@ -1306,7 +1306,7 @@ export function calculateGoogleBudgetTokens(maxTokens, reasoningEffort, model) {
         return getGemini3ProBudget();
     }
 
-    if (/gemini-3[.\d]*-flash|gemini-4-(?:argon|carbon)(?:-|$)/.test(model)) {
+    if (/gemini-3[.\d]*-flash|gemini-4-argon/.test(model)) {
         return getThinkingLevel();
     }
 

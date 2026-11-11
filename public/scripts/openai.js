@@ -5143,7 +5143,7 @@ function getGeminiMaxContext(model, isUnlocked) {
 
     /** @type {[RegExp, number][]} */
     const contextMap = [
-        [/gemini-4-(?:argon|carbon)/, max_1mil],
+        [/gemini-4-argon/, max_1mil],
         [/gemini-2\.5-flash-image/, max_32k],
         [/gemini-3\.1-flash-image/, max_128k],
         [/gemini-3-pro-image/, max_64k],
@@ -5529,7 +5529,7 @@ async function onModelChange() {
     if ($(this).is('#model_vertexai_select')) {
         console.log('Vertex AI model changed to', value);
         oai_settings.vertexai_model = value;
-        if (/^gemini-4-(?:argon|carbon)(?:-|$)/.test(value) && oai_settings.vertexai_region === default_settings.vertexai_region) {
+        if (value === 'gemini-4-argon' && oai_settings.vertexai_region === default_settings.vertexai_region) {
             $('#vertexai_region').val('global').trigger('input');
         }
     }
@@ -6270,7 +6270,6 @@ export function isImageInliningSupported() {
         'gemini-2.5',
         'gemini-3',
         'gemini-4-argon',
-        'gemini-4-carbon',
         'gemini-exp-1206',
         'learnlm',
         'gemini-robotics',
@@ -6389,7 +6388,6 @@ export function isVideoInliningSupported() {
         'gemini-exp-1206',
         'gemini-3',
         'gemini-4-argon',
-        'gemini-4-carbon',
         'gemma-4',
         // Z.AI (GLM)
         'glm-4.5v',
@@ -6429,7 +6427,6 @@ export function isAudioInliningSupported() {
         'gemini-2.5',
         'gemini-3',
         'gemini-4-argon',
-        'gemini-4-carbon',
         'gemini-exp-1206',
         'gpt-4o-audio',
         'gpt-4o-realtime',
