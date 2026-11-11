@@ -12,7 +12,7 @@ import { GEMINI_SAFETY, VERTEX_SAFETY } from '../constants.js';
 import { delay, getConfigValue, trimTrailingSlash } from '../util.js';
 
 const API_MAKERSUITE = 'https://generativelanguage.googleapis.com';
-const API_VERTEX_AI = 'https://us-central1-aiplatform.googleapis.com';
+const API_VERTEX_AI = 'https://aiplatform.googleapis.com';
 
 function createWavHeader(dataSize, sampleRate, numChannels = 1, bitsPerSample = 16) {
     const header = Buffer.alloc(44);
@@ -162,8 +162,12 @@ export function getProjectIdFromServiceAccount(serviceAccount) {
  * @returns {Promise<{url: string, headers: object, apiName: string, baseUrl: string, safetySettings: object[]}>} URL, headers, and API name
  */
 export async function getGoogleApiConfig(request, model, endpoint = 'generateContent') {
-    const useVertexAi = request.body.api === 'vertexai';
-    const region = request.body.vertexai_region || 'us-central1';
+    const useVertexAi = request.body.api === 'vertexai' || request.body.chat_completion_source === 'vertexai';
+    const isGemini4 = /^gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+    let region = String(request.body.vertexai_region || '').trim().toLowerCase() || 'us-central1';
+    if (isGemini4 && region === 'us-central1') {
+        region = 'global';
+    }
     const apiName = useVertexAi ? 'Google Vertex AI' : 'Google AI Studio';
     const safetySettings = [...GEMINI_SAFETY, ...(useVertexAi ? VERTEX_SAFETY : [])];
 
@@ -178,10 +182,14 @@ export async function getGoogleApiConfig(request, model, endpoint = 'generateCon
         const { authHeader, authType } = await getVertexAIAuth(request);
 
         if (authType === 'express') {
-            // Express mode: use API key parameter
+            // A publisher-only Express URL does not encode a location. Gemini 4
+            // needs an explicit project/location path to honor the selected region.
             const keyParam = authHeader.replace('Bearer ', '');
-            const projectId = request.body.vertexai_express_project_id;
-            baseUrl = region === 'global'
+            const projectId = String(request.body.vertexai_express_project_id || '').trim();
+            if (isGemini4 && !projectId) {
+                throw new Error(`Project ID is required for Gemini 4 in Vertex AI Express mode to use region "${region}". Enter your Google Cloud Project ID or project number.`);
+            }
+            baseUrl = !projectId || region === 'global'
                 ? 'https://aiplatform.googleapis.com/v1'
                 : `https://${region}-aiplatform.googleapis.com/v1`;
             url = projectId

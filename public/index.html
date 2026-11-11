@@ -3410,13 +3410,12 @@
                                         <input id="vertexai_express_project_id" name="vertexai_express_project_id" class="text_pole flex1" value="" type="text" autocomplete="off" placeholder="Enter your Project ID">
                                     </div>
                                     <div class="toggle-description justifyLeft marginBot5">
-                                        <small data-i18n="Project ID is required when selecting regions other than the default (us-central1). You can find this in a model 404 error message.">
-                                            `Project ID` is only required when selecting regions other than the default (us-central1).<br>
-                                            You can find this in a model 404 error message.
+                                        <small data-i18n="Enter your Google Cloud Project ID or project number to apply the selected region explicitly. Without it, Express mode uses an implicit project and location.">
+                                            Enter your Google Cloud Project ID or project number to apply the selected region explicitly. Without it, Express mode uses an implicit project and location.
                                         </small>
                                         <br>
-                                        <small data-i18n="For Gemini 4 Argon, set Region to global and enter your Project ID or the project number from the error message.">
-                                            For Gemini 4 Argon, set Region to global and enter your Project ID or the project number from the error message.
+                                        <small data-i18n="For Gemini 4 Argon and Carbon, Project ID is required. Use global (recommended), us, or eu for Region.">
+                                            For Gemini 4 Argon and Carbon, Project ID is required. Use global (recommended), us, or eu for Region.
                                         </small>
                                     </div>
                                 </div>
@@ -3465,6 +3464,8 @@
 
                                 <datalist id="vertexai_region_suggestions">
                                     <option value="global">global</option>
+                                    <option value="us">us</option>
+                                    <option value="eu">eu</option>
                                     <option value="us-central1">us-central1</option>
                                     <option value="us-east1">us-east1</option>
                                     <option value="us-east4">us-east4</option>
@@ -3493,6 +3494,7 @@
                                     <!-- data-mode="full" is for models that require a service account -->
                                     <optgroup label="Gemini 4">
                                         <option value="gemini-4-argon">gemini-4-argon</option>
+                                        <option value="gemini-4-carbon">gemini-4-carbon</option>
                                     </optgroup>
                                     <optgroup label="Gemini 3.8">
                                         <option value="gemini-3.8-flash">gemini-3.8-flash</option>
