@@ -711,7 +711,7 @@ async function sendMakerSuiteRequest(request, response) {
             // Cancel even unfinished error bodies and release their abort listeners.
             upstreamController.abort();
             generateResponse.body?.destroy();
-            const retryDelay = 1000 + Math.floor(Math.random() * 2001);
+            const retryDelay = 5000 + Math.floor(Math.random() * 5001);
             console.warn(`${apiName} Express rate limited (429). Retrying in ${retryDelay} ms; stop generation to cancel.`);
             await delay(retryDelay, undefined, { signal: controller.signal });
         }

@@ -84,7 +84,7 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
         };
     }
 
-    test.each([false, true])('retries repeated 429s with fresh 1-3 second delays and stream=%s', async (stream) => {
+    test.each([false, true])('retries repeated 429s with fresh 5-10 second delays and stream=%s', async (stream) => {
         jest.spyOn(Math, 'random')
             .mockReturnValueOnce(0).mockReturnValueOnce(0.5).mockReturnValueOnce(0.999999)
             .mockReturnValue(0.25);
@@ -95,7 +95,7 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
         expect(response.status).toBe(200);
         expect(await response.text()).toContain('Hello');
         expect(fetchMock).toHaveBeenCalledTimes(13);
-        expect(retryDelayMock.mock.calls.map(([ms]) => ms)).toEqual([1000, 2000, 3000, ...Array(9).fill(1500)]);
+        expect(retryDelayMock.mock.calls.map(([ms]) => ms)).toEqual([5000, 7500, 10000, ...Array(9).fill(6250)]);
         for (const error of errors) expect(error.body.destroyed).toBe(true);
         for (const call of fetchMock.mock.calls) {
             expect(call).toEqual([fetchMock.mock.calls[0][0], {
