@@ -1,6 +1,7 @@
 /* eslint-disable dot-notation */
 import { createHmac } from 'node:crypto';
 import process from 'node:process';
+import { setTimeout as delay } from 'node:timers/promises';
 import util from 'node:util';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -452,6 +453,7 @@ async function sendClaudeRequest(request, response) {
  */
 async function sendMakerSuiteRequest(request, response) {
     const useVertexAi = request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.VERTEXAI;
+    const retryOnRateLimit = useVertexAi && (request.body.vertexai_auth_mode || 'express') === 'express';
     const apiName = useVertexAi ? 'Google Vertex AI' : 'Google AI Studio';
     let apiUrl;
     let apiKey;
@@ -665,13 +667,16 @@ async function sendMakerSuiteRequest(request, response) {
     const body = getGeminiBody();
     console.debug(`${apiName} request:`, body);
 
-    try {
-        const controller = new AbortController();
-        request.socket.removeAllListeners('close');
-        request.socket.on('close', function () {
-            controller.abort();
-        });
+    const controller = new AbortController();
+    let upstreamController;
+    request.socket.removeAllListeners('close');
+    request.socket.on('close', () => {
+        controller.abort();
+        upstreamController?.abort();
+    });
+    if (response.destroyed) controller.abort();
 
+    try {
         const apiVersion = getConfigValue('gemini.apiVersion', 'v1beta');
         const responseType = (stream ? 'streamGenerateContent' : 'generateContent');
 
@@ -691,12 +696,25 @@ async function sendMakerSuiteRequest(request, response) {
             url = `${apiUrl.toString().replace(/\/$/, '')}/${apiVersion}/models/${model}:${responseType}?key=${apiKey}${stream ? '&alt=sse' : ''}`;
         }
 
-        const generateResponse = await fetch(url, {
+        const fetchOptions = {
             body: JSON.stringify(body),
             method: 'POST',
             headers: headers,
-            signal: controller.signal,
-        });
+        };
+        let generateResponse;
+        while (true) {
+            controller.signal.throwIfAborted();
+            upstreamController = new AbortController();
+            generateResponse = await fetch(url, { ...fetchOptions, signal: upstreamController.signal });
+            if (!retryOnRateLimit || generateResponse.status !== 429) break;
+
+            // Cancel even unfinished error bodies and release their abort listeners.
+            upstreamController.abort();
+            generateResponse.body?.destroy();
+            const retryDelay = 1000 + Math.floor(Math.random() * 2001);
+            console.warn(`${apiName} Express rate limited (429). Retrying in ${retryDelay} ms; stop generation to cancel.`);
+            await delay(retryDelay, undefined, { signal: controller.signal });
+        }
 
         if (stream) {
             try {
@@ -746,6 +764,7 @@ async function sendMakerSuiteRequest(request, response) {
             return response.send(reply);
         }
     } catch (error) {
+        if (controller.signal.aborted) return;
         console.error(`Error communicating with ${apiName} API:`, error);
         if (!response.headersSent) {
             return response.status(500).send({ error: true });

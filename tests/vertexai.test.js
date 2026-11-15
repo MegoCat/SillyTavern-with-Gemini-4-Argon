@@ -1,15 +1,21 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, jest, test } from '@jest/globals';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, jest, test } from '@jest/globals';
+import { getEventListeners, once } from 'node:events';
+import http from 'node:http';
 import { Readable } from 'node:stream';
 import { generateKeyPairSync } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import nodeFetch from 'node-fetch';
 import { setConfigFilePath } from '../src/util.js';
 
 setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
 
 const secrets = await import('../src/endpoints/secrets.js');
 const fetchMock = jest.fn();
+const retryDelayMock = jest.fn();
 const readSecretMock = jest.fn(() => 'vertex-test-key');
 jest.unstable_mockModule('node-fetch', () => ({ default: fetchMock }));
+jest.unstable_mockModule('node:timers/promises', () => ({ setTimeout: retryDelayMock }));
 jest.unstable_mockModule('../src/endpoints/secrets.js', () => ({
     ...secrets,
     readSecret: readSecretMock,
@@ -41,6 +47,7 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
     });
 
     beforeEach(() => {
+        retryDelayMock.mockReset().mockImplementation((_ms, value, options) => delay(1, value, options));
         readSecretMock.mockReset().mockReturnValue('vertex-test-key');
         fetchMock.mockReset().mockImplementation(async () => ({
             ok: true,
@@ -51,9 +58,12 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
         }));
     });
 
-    async function generate(overrides = {}) {
+    afterEach(() => jest.restoreAllMocks());
+
+    async function generate(overrides = {}, signal) {
         return fetch(`${baseUrl}/generate`, {
             method: 'POST',
+            signal,
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_completion_source: 'vertexai', vertexai_auth_mode: 'express',
@@ -64,6 +74,147 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
             }),
         });
     }
+
+    function errorResponse(status = 429) {
+        const text = JSON.stringify({ error: { code: status, message: 'Upstream error' } });
+        return {
+            ok: false, status, statusText: 'Upstream error',
+            body: Readable.from([text]),
+            text: async () => text,
+        };
+    }
+
+    test.each([false, true])('retries repeated 429s with fresh 1-3 second delays and stream=%s', async (stream) => {
+        jest.spyOn(Math, 'random')
+            .mockReturnValueOnce(0).mockReturnValueOnce(0.5).mockReturnValueOnce(0.999999)
+            .mockReturnValue(0.25);
+        const errors = Array.from({ length: 12 }, () => errorResponse());
+        errors.forEach(error => fetchMock.mockResolvedValueOnce(error));
+
+        const response = await generate({ stream });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain('Hello');
+        expect(fetchMock).toHaveBeenCalledTimes(13);
+        expect(retryDelayMock.mock.calls.map(([ms]) => ms)).toEqual([1000, 2000, 3000, ...Array(9).fill(1500)]);
+        for (const error of errors) expect(error.body.destroyed).toBe(true);
+        for (const call of fetchMock.mock.calls) {
+            expect(call).toEqual([fetchMock.mock.calls[0][0], {
+                ...fetchMock.mock.calls[0][1], signal: expect.any(AbortSignal),
+            }]);
+        }
+    });
+
+    test('closes unfinished 429 responses before retrying through a proxy', async () => {
+        let attempts = 0;
+        const upstream = http.createServer((req, res) => {
+            req.resume();
+            if (++attempts <= 12) {
+                res.writeHead(429, { 'Content-Type': 'application/json' });
+                res.write('{"error":'); // Deliberately never finish the rate-limit body.
+            } else {
+                res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Recovered' }] } }] }));
+            }
+        });
+        upstream.listen(0, '127.0.0.1');
+        await once(upstream, 'listening');
+        fetchMock.mockImplementation(nodeFetch);
+        try {
+            const response = await generate({ reverse_proxy: `http://127.0.0.1:${upstream.address().port}` });
+            expect(await response.text()).toContain('Recovered');
+            expect(attempts).toBe(13);
+            for (const [, { signal }] of fetchMock.mock.calls.slice(0, 12)) {
+                expect(signal.aborted).toBe(true);
+                expect(getEventListeners(signal, 'abort')).toHaveLength(0);
+            }
+        } finally {
+            upstream.closeAllConnections();
+            await new Promise(resolve => upstream.close(resolve));
+        }
+    });
+
+    test('retries when the auth mode defaults to Express', async () => {
+        fetchMock.mockResolvedValueOnce(errorResponse());
+        const response = await generate({ vertexai_auth_mode: undefined });
+        expect(await response.text()).toContain('Hello');
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(retryDelayMock).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([false, true])('stops retrying when a different error follows a 429 with stream=%s', async (stream) => {
+        fetchMock.mockResolvedValueOnce(errorResponse()).mockResolvedValueOnce(errorResponse(503));
+        const response = await generate({ stream });
+        expect(response.ok).toBe(false);
+        expect((await response.json()).error.code).toBe(503);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(retryDelayMock).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([
+        ['makersuite', 'express', false], ['makersuite', 'express', true],
+        ['vertexai', 'full', false], ['vertexai', 'full', true],
+    ])('does not retry 429 in %s/%s with stream=%s', async (source, mode, stream) => {
+        let authRequests = 0;
+        if (mode === 'full') {
+            const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+            readSecretMock.mockReturnValue(JSON.stringify({
+                project_id: 'service-project', client_email: 'test@example.com',
+                private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+            }));
+            fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: 'service-token' }) });
+            authRequests = 1;
+        }
+        fetchMock.mockResolvedValueOnce(errorResponse());
+        const response = await generate({ chat_completion_source: source, vertexai_auth_mode: mode, stream });
+        expect(response.ok).toBe(false);
+        expect((await response.json()).error.code).toBe(429);
+        expect(fetchMock).toHaveBeenCalledTimes(authRequests + 1);
+        expect(retryDelayMock).not.toHaveBeenCalled();
+    });
+
+    test.each([false, true])('cancels the retry wait immediately with stream=%s', async (stream) => {
+        let notifyWaiting;
+        const waiting = new Promise(resolve => { notifyWaiting = resolve; });
+        retryDelayMock.mockImplementationOnce((ms, value, options) => {
+            notifyWaiting(options.signal);
+            return delay(ms, value, options);
+        });
+        fetchMock.mockResolvedValue(errorResponse());
+        const controller = new AbortController();
+        const pending = generate({ stream }, controller.signal).catch(error => error);
+        const upstreamSignal = await waiting;
+        const aborted = once(upstreamSignal, 'abort');
+        controller.abort();
+
+        const [error] = await Promise.all([pending, aborted]);
+        expect(error).toMatchObject({ name: 'AbortError' });
+        await expect(retryDelayMock.mock.results[0].value).rejects.toMatchObject({ name: 'AbortError' });
+        expect(upstreamSignal.aborted).toBe(true);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(retryDelayMock).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([false, true])('cancels an in-flight retry with stream=%s', async (stream) => {
+        let notifyStarted;
+        const started = new Promise(resolve => { notifyStarted = resolve; });
+        fetchMock.mockResolvedValueOnce(errorResponse()).mockImplementationOnce((_url, { signal }) => {
+            return new Promise((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+                notifyStarted(signal);
+            });
+        });
+        const controller = new AbortController();
+        const pending = generate({ stream }, controller.signal).catch(error => error);
+        const upstreamSignal = await started;
+        const aborted = once(upstreamSignal, 'abort');
+        controller.abort();
+
+        const [error] = await Promise.all([pending, aborted]);
+        expect(error).toMatchObject({ name: 'AbortError' });
+        await expect(fetchMock.mock.results[1].value).rejects.toMatchObject({ name: 'AbortError' });
+        expect(upstreamSignal.aborted).toBe(true);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(retryDelayMock).toHaveBeenCalledTimes(1);
+    });
 
     test.each([
         [false, 'auto', null], [false, 'min', 'LOW'], [false, 'low', 'LOW'],
