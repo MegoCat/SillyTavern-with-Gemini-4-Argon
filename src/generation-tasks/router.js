@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { GenerationTaskStore, hash, taskError, writePrivateFile } from './store.js';
-import { buildRecoveredMessage, chatFingerprintInput, hasCompletedTask, parseVertexReply, planRecovery } from '../../public/scripts/util/generation-recovery.js';
+import { buildRecoveredMessage, chatFingerprintInput, hasCompletedTask, planRecovery } from '../../public/scripts/util/generation-recovery.js';
 import { registerToolRoutes } from './tool-round.js';
 
 const stores = new Map();
@@ -58,10 +58,21 @@ export function attachTaskResponse(store, record, response) {
     };
     // A proxy can close a partial HTTP stream cleanly. Only signal success after the final result is stored.
     const end = () => response.end(record.stream && record.status === 'completed' ? `\n\nevent: ${streamEndEvent}\ndata: [DONE]\n\n` : undefined);
+    const writeResult = (body, reply) => {
+        if (!record.returnToolCallAsText || !record.firstToolCall) return response.write(body);
+        // Clients without a tool mode treat a raw functionCall as an instruction to run a plugin.
+        reply ??= store.parseReply(record, body);
+        const content = { role: 'model', parts: [{ text: reply.text }] };
+        if (record.stream) {
+            const event = { candidates: [{ content, finishReason: reply.finishReason ?? undefined }] };
+            return response.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+        return response.write(JSON.stringify({ choices: [{ message: { content: reply.text } }], responseContent: content }));
+    };
     if (!sink) {
         if (record.acknowledged || record.status !== 'completed') return response.status(409).json({ error: { message: record.error || `Task is ${record.status}.` } });
         headers();
-        response.write(store.result(record.id));
+        writeResult(store.result(record.id));
         return end();
     }
     const cleanup = () => {
@@ -75,14 +86,19 @@ export function attachTaskResponse(store, record, response) {
         // A suspended phone must not backpressure the model or grow an unbounded outgoing queue.
         if (response.writableLength > 1024 * 1024) { cleanup(); response.destroy(); return; }
         headers();
+        if (record.returnToolCallAsText && sink.statusCode < 400) {
+            if (record.stream && !response.headersSent) response.flushHeaders?.();
+            return;
+        }
         response.write(chunk);
         response.flush?.();
     };
-    const onTerminal = (result) => {
+    const onTerminal = (result, body, reply) => {
         cleanup();
         if (response.destroyed) return;
         if (result.status === 'cancelled' || (result.status === 'failed' && sink.statusCode < 400)) { response.destroy(); return; }
         headers();
+        if (record.returnToolCallAsText && result.status === 'completed') writeResult(body, reply);
         end();
     };
     sink.on('chunk', onChunk);
@@ -118,7 +134,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         const store = storeFor(req);
         const task = store.require(req.params.id);
         if (task.status !== 'completed') throw taskError(task.error || 'No final reply is available.', 409);
-        res.json({ task: store.summary(task, true), reply: parseVertexReply(store.result(task.id).toString('utf8'), task.stream, task.context) });
+        res.json({ task: store.summary(task, true), reply: store.parseReply(task) });
     }));
     router.post('/recovery/:id/cancel', route((req, res) => {
         const store = storeFor(req);
@@ -158,7 +174,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
             return res.json({ ok: true, alreadySaved: true });
         }
         store.checkLease(task.id, req.body?.token);
-        const reply = parseVertexReply(store.result(task.id).toString('utf8'), task.stream, task.context);
+        const reply = store.parseReply(task);
         const { text, reasoning } = req.body ?? {};
         if (!reply.firstToolCall && (typeof text !== 'string' || typeof reasoning !== 'string'
             || Buffer.byteLength(text + reasoning) > store.options.maxBytes)) throw taskError('Invalid restored message.');
@@ -189,8 +205,6 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         if (req.body.chat_completion_source !== 'vertexai' || (req.body.vertexai_auth_mode || 'express') !== 'express'
             || req.body.request_images) throw taskError('Recovery requires a Vertex AI Express text request.');
         if (req.body.tools != null && !Array.isArray(req.body.tools)) throw taskError('Invalid function tool declarations.');
-        if (recovery.context?.captureFirstToolCall && (!req.body.tools?.length || recovery.parentId)) throw taskError('First function call recovery requires an initial request with tools.');
-        if (req.body.tools?.length && recovery.context?.toolDepth === undefined && !recovery.context?.captureFirstToolCall) throw taskError('Tool recovery was not enabled for this request.');
         const body = { ...req.body };
         delete body.generation_recovery;
         if ((body.type || 'normal') !== recovery.context?.type) throw taskError('Recovery generation type does not match the request.');

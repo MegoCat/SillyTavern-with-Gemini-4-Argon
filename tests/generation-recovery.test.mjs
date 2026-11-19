@@ -729,6 +729,78 @@ test('tool calls survive SSE chunk boundaries with separate ordered IDs, argumen
     ]);
 });
 
+for (const stream of [false, true]) {
+    test(`tool declarations without recovery mode return the first call as text (${stream ? 'SSE' : 'JSON'})`, async t => {
+        let modelCalls = 0;
+        let upstream;
+        const app = routerFixture(t, (req, sink) => {
+            modelCalls++;
+            assert.equal(req.body.tools[0].function.name, capturedCall.name);
+            assert.equal(req.body.tool_choice, 'required');
+            upstream = sink;
+        });
+        const { id, body } = app.generate(randomUUID(), stream);
+        body.tools = [{ type: 'function', function: { name: capturedCall.name } }];
+        body.tool_choice = 'required';
+        const generate = async () => (await app.call('POST', '/generate', body)).response;
+        const original = await generate();
+        await nextTurn();
+        if (stream) {
+            upstream.write(eventFor(capturedParts[0]));
+            upstream.write(eventFor(capturedParts[1]));
+            assert.equal(original.text(), '');
+        }
+        original.destroy();
+        const reconnected = await generate();
+        if (stream) upstream.end(eventFor(capturedParts[2]) + finalEvent);
+        else upstream.json({ responseContent: { parts: capturedParts } });
+        await nextTurn();
+
+        const replay = await generate();
+        assert.equal(modelCalls, 1);
+        assert.equal(reconnected.statusCode, 200);
+        assert.equal(reconnected.text(), replay.text());
+        const delivered = parseVertexReply(replay.text(), stream);
+        assert.deepEqual(JSON.parse(delivered.text.split('\n').slice(1, -1).join('\n')), capturedCall);
+        assert.equal(delivered.hasTools, false);
+        if (stream) assert.match(replay.text(), /event: generation-complete\ndata: \[DONE\]/);
+        else assert.equal(replay.data().choices[0].message.content, delivered.text);
+
+        const base = `/recovery/${id}`;
+        const { task, reply } = (await app.call('GET', base + '/result')).response.data();
+        assert.equal(reply.text, delivered.text);
+        assert.equal(task.firstToolCall, true);
+        assert.equal(task.tools, undefined);
+        const restarted = new GenerationTaskStore(path.join(app.root, 'generation-tasks'));
+        assert.equal(restarted.parseReply(restarted.require(id)).text, delivered.text);
+        assert.equal((await app.call('POST', base + '/tools/prepare')).response.statusCode, 409);
+        const client = randomUUID();
+        assert.equal((await app.call('POST', base + '/claim', { client })).response.statusCode, 409);
+        const now = Date.now;
+        t.mock.method(Date, 'now', () => now() + 4000);
+        const { token } = (await app.call('POST', base + '/claim', { client })).response.data();
+        const saved = (await app.call('POST', base + '/apply', { token, includeMessage: true })).response.data();
+        assert.equal(saved.message.mes, delivered.text);
+        assert.ok(hasCompletedTask(saved.message, id));
+        assert.equal((await app.call('POST', base + '/apply', { token })).response.data().alreadySaved, true);
+    });
+}
+
+test('ordinary replies to tool requests keep their API fields when the capture flag is false or omitted', async t => {
+    let calls = 0;
+    const app = routerFixture(t, (_req, sink) => { calls++; sink.send(replyJSON()); });
+    const { id, body } = app.generate(randomUUID(), false);
+    body.tools = [{ type: 'function', function: { name: 'optional' } }];
+    body.generation_recovery.context.captureFirstToolCall = false;
+    const { response } = await app.call('POST', '/generate', body);
+    await nextTurn();
+    assert.equal(response.text(), replyJSON());
+    delete body.generation_recovery.context.captureFirstToolCall;
+    assert.equal((await app.call('POST', '/generate', body)).response.text(), replyJSON());
+    assert.equal((await app.call('GET', `/recovery/${id}/result`)).response.data().reply.signature, 'opaque-signature==');
+    assert.equal(calls, 1);
+});
+
 test('competing tabs, lost receipts and a skipped unknown outcome produce one transcript and one follow-up', async t => {
     let modelCalls = 0;
     const app = routerFixture(t, (_req, sink) => {
@@ -796,9 +868,6 @@ test('recoverable tools reject changed chats and stop exactly once for stealth t
 
 test('only explicitly offered tools can be recovered, and cancellation rejects late receipts', async t => {
     const app = routerFixture(t, (_req, sink) => sink.json({ responseContent: { parts: [toolParts[1]] } }));
-    const unsupported = makeToolJob(app);
-    delete unsupported.body.generation_recovery.context.toolDepth;
-    assert.equal((await app.call('POST', '/generate', unsupported.body)).response.statusCode, 400);
     const wrong = makeToolJob(app);
     wrong.body.tools[0].function.name = 'other';
     await app.call('POST', '/generate', wrong.body); await nextTurn();

@@ -46,7 +46,8 @@ export function validateContext(context) {
     if (['continue', 'swipe'].includes(context.type) && (!context.baseLast || context.baseLast.is_user)) throw taskError('Recovery needs an assistant message to continue or swipe.');
     if (Buffer.byteLength(JSON.stringify(context)) > 1024 * 1024) throw taskError('Recovery metadata is too large.', 413);
     if (context.toolDepth !== undefined && (!Number.isSafeInteger(context.toolDepth) || context.toolDepth < 0 || context.toolDepth > 50)) throw taskError('Invalid tool recursion depth.');
-    if (context.captureFirstToolCall !== undefined && (context.captureFirstToolCall !== true || context.toolDepth !== undefined)) throw taskError('Invalid first function call recovery mode.');
+    if (context.captureFirstToolCall !== undefined && (typeof context.captureFirstToolCall !== 'boolean'
+        || (context.captureFirstToolCall && context.toolDepth !== undefined))) throw taskError('Invalid first function call recovery mode.');
     // Whitelist fields; do not accidentally persist request secrets added by an extension.
     return {
         version: RECOVERY_VERSION, type: context.type,
@@ -150,8 +151,10 @@ export class GenerationTaskStore {
             && record.context.chat.avatar === context.chat.avatar && record.context.chat.fileName === context.chat.fileName)) {
             throw taskError('This chat already has an unfinished or unrecovered generation. Recover or stop it before generating again.', 409);
         }
+        const returnToolCallAsText = !parent && requestBody.tools?.length > 0 && context.toolDepth === undefined && !context.captureFirstToolCall;
         const record = {
             id, context, fingerprint, status: 'running', stream: Boolean(requestBody.stream),
+            ...(returnToolCallAsText ? { returnToolCallAsText: true } : {}),
             ...(context.toolDepth !== undefined ? { offeredTools: (requestBody.tools ?? []).map(tool => tool.function?.name).filter(name => typeof name === 'string') } : {}),
             ...(parent ? { parentId: parent.id } : {}),
             model: String(requestBody.model ?? ''), createdAt: Date.now(), updatedAt: Date.now(),
@@ -173,10 +176,11 @@ export class GenerationTaskStore {
         const body = Buffer.concat(sink.chunks);
         record.responseStatus = sink.statusCode;
         record.bytes = body.length;
+        let reply;
         try {
             if (!error && sink.statusCode >= 400) error = new Error(`The model request failed (HTTP ${sink.statusCode}).`);
             if (!error) {
-                const reply = parseVertexReply(body.toString('utf8'), record.stream, record.context);
+                reply = this.parseReply(record, body);
                 if (reply.firstToolCall) record.firstToolCall = true;
                 if (record.context.toolDepth !== undefined && reply.hasTools) {
                     if (reply.hasImages || reply.toolCalls.some(call => !record.offeredTools.includes(call.name))) throw new Error('The model returned media or an undeclared function tool.');
@@ -196,7 +200,7 @@ export class GenerationTaskStore {
             console.error(record.error);
         }
         this.live.delete(id);
-        sink.emit('terminal', record);
+        sink.emit('terminal', record, body, reply);
         sink.chunks = [];
         if (error) sink.socket.emit('close');
     }
@@ -205,6 +209,11 @@ export class GenerationTaskStore {
         if (record.status === 'running') throw taskError('Generation is still running.', 409);
         if (record.acknowledged) throw taskError('This result was already acknowledged.', 410);
         return fs.readFileSync(this.file(id, 'body'));
+    }
+    parseReply(record, body = this.result(record.id)) {
+        return parseVertexReply(body.toString('utf8'), record.stream, {
+            captureFirstToolCall: record.context.captureFirstToolCall, returnToolCallAsText: record.returnToolCallAsText,
+        });
     }
     cancel(id) {
         const record = this.require(id);
@@ -238,8 +247,8 @@ export class GenerationTaskStore {
         validateId(client);
         const record = this.require(id);
         if (record.status !== 'completed' || record.acknowledged) throw taskError('No completed result is available.', 409);
-        // Text may still be saving normally. For a captured call every tab, including the original, uses /apply.
-        if (!record.firstToolCall && Date.now() - record.updatedAt < 3000) throw taskError('The original client may still be saving this reply.', 409);
+        // Only clients that explicitly requested first-call capture use /apply during live delivery.
+        if ((!record.firstToolCall || !record.context.captureFirstToolCall) && Date.now() - record.updatedAt < 3000) throw taskError('The original client may still be saving this reply.', 409);
         const existing = this.leases.get(id);
         if (existing && existing.expires > Date.now() && existing.client !== client) throw taskError('Another tab is restoring this reply.', 409);
         const lease = { client, token: existing?.client === client ? existing.token : randomUUID(), expires: Date.now() + 30000 };

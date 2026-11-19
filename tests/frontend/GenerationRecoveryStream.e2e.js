@@ -21,6 +21,21 @@ test('copied function JSON preserves Markdown, macros, and literal HTML inside a
     expect(displayed).toEqual({ prefix: 'Existing reply', values: [{ name: 'capture', args }, { name: 'capture', args }] });
 });
 
+test('a browser that renders the first function as ordinary Markdown can copy the original arguments', async ({ page }) => {
+    await testSetup.awaitST({ page });
+    const call = { name: 'scene', args: { code: '```html\n<b>&amp;</b>\n```', template: '{{user}}', formula: '\\begin{align*}x\\end{align*}' } };
+    const copied = await page.evaluate(async call => {
+        const { parseVertexReply } = await import('/scripts/util/generation-recovery.js');
+        const { messageFormatting } = await import('/script.js');
+        const body = JSON.stringify({ responseContent: { parts: [{ functionCall: call }] } });
+        const { text } = parseVertexReply(body, false, { returnToolCallAsText: true });
+        const el = document.createElement('div');
+        el.innerHTML = messageFormatting(text, 'Character', false, false, -1);
+        return JSON.parse(el.querySelector('pre code').textContent);
+    }, call);
+    expect(copied).toEqual(call);
+});
+
 test('chat completions distinguishes a truncated recovery stream from legacy EOF', async ({ page }) => {
     const chunk = 'data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}\n\n';
     const tracked = { 'X-Generation-Stream-End': 'generation-complete' };

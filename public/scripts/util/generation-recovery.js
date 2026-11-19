@@ -79,7 +79,7 @@ export function planRecovery(messages, context, id, hash) {
 }
 
 /** Parse a complete Vertex response, retaining all text parts and the opaque signature. */
-export function parseVertexReply(body, stream, { captureFirstToolCall = false } = {}) {
+export function parseVertexReply(body, stream, { captureFirstToolCall = false, returnToolCallAsText = false } = {}) {
     const result = { text: '', reasoning: '', signature: null, finishReason: null, hasTools: false, toolCalls: [], hasImages: false };
     let sawTerminal = !stream;
     let firstCall;
@@ -88,7 +88,7 @@ export function parseVertexReply(body, stream, { captureFirstToolCall = false } 
             if (part.functionCall && !firstCall) {
                 const { name, args = {}, id } = part.functionCall;
                 if (typeof name !== 'string' || !name || !args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid Vertex function call.');
-                if (captureFirstToolCall) {
+                if (captureFirstToolCall || returnToolCallAsText) {
                     // This backend requests complete Vertex arguments. Never publish a partial argument delta as a finished call.
                     if (part.functionCall.willContinue || part.functionCall.partialArgs?.length) throw new Error('Vertex returned incomplete function arguments.');
                     firstCall = part.functionCall;
@@ -136,8 +136,12 @@ export function parseVertexReply(body, stream, { captureFirstToolCall = false } 
     }
     if (!sawTerminal) throw new Error('The upstream stream ended without a final result. Partial text will not be restored automatically.');
     if (firstCall) {
-        // Keep provider-specific fields, and keep call signatures and executable tool metadata out of chat history.
-        return { ...result, firstToolCall: true, text: '```json\n' + JSON.stringify(firstCall, null, 2) + '\n```', reasoning: '', signature: null, hasImages: false };
+        let json = JSON.stringify(firstCall, null, 2);
+        if (returnToolCallAsText) {
+            // Protect literal backslashes, macros, fences and HTML from the legacy chat formatter.
+            json = json.replace(/\\\\|[`<>&]|\{(?=\{)/g, literal => '\\u' + literal.charCodeAt(0).toString(16).padStart(4, '0'));
+        }
+        return { ...result, firstToolCall: true, text: '```json\n' + json + '\n```', reasoning: '', signature: null, hasImages: false };
     }
     if (!result.text && !result.reasoning && !result.hasTools && !result.hasImages) throw new Error('The model returned no reply.');
     return result;
