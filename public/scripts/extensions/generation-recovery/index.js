@@ -7,6 +7,12 @@ import { RECOVERY_TYPES, RECOVERY_VERSION, chatFingerprintInput, markTask, planR
 
 const BASE = '/api/backends/chat-completions/recovery';
 const CANCEL_KEY = 'generation-recovery-cancel-requests';
+const TOOL_SETTING = 'generation-recovery-tools';
+const pendingToolResults = new Map();
+const pendingToolStarts = new Map();
+let toolWorker;
+let stoppingTool;
+let followupParent;
 const clientId = getContext().uuidv4();
 const localTasks = new Map();
 const warned = new Set();
@@ -92,6 +98,8 @@ async function deliverCancel(id, requestedAt, keepalive = false) {
     try {
         await jsonRequest(`${BASE}/${id}/cancel`, 'POST', {}, { keepalive });
         forgetCancel(id);
+        forgetToolResult(id);
+        pendingToolStarts.delete(id);
         localTasks.delete(id);
     } catch (error) {
         // The original generate POST can arrive after its cancel request.
@@ -100,6 +108,7 @@ async function deliverCancel(id, requestedAt, keepalive = false) {
     }
 }
 async function cancelTask(id) {
+    if (id === toolWorker || id === followupParent) stoppingTool = id;
     const requestedAt = Date.now();
     try {
         // AccountStorage saves to the server. A separate local key per task survives an offline reload and concurrent tabs.
@@ -111,29 +120,38 @@ async function cancelTask(id) {
     schedule(0);
 }
 
-async function prepareGeneration(data) {
+async function prepareGeneration(data, toolTurn) {
     const ctx = getContext();
     const type = data.type || 'normal';
     const chat = currentChat();
+    const parent = toolTurn?.parent;
+    const trackTools = toolsEnabled() && toolTurn && (toolTurn.allowed || parent);
+    if (parent && (stoppingTool === parent.id || pendingCancels()[parent.id] || !trackTools || !sameChat(parent.chat, chat) || parent.history !== historyHash(ctx.chat)
+        || parent.model !== data.model || data.chat_completion_source !== 'vertexai' || (data.vertexai_auth_mode || 'express') !== 'express' || data.request_images)) {
+        throw new Error('请在原聊天使用原来的 Vertex AI 快速模式和模型继续工具调用。');
+    }
     if (!chat || !RECOVERY_TYPES.includes(type) || data.chat_completion_source !== 'vertexai'
-        || (data.vertexai_auth_mode || 'express') !== 'express' || data.tools?.length || data.request_images) return;
+        || (data.vertexai_auth_mode || 'express') !== 'express' || (data.tools?.length && !trackTools) || data.request_images) return;
     if (restoring || sameChat(pendingApply?.context.chat, chat)) throw new Error('上一条回复正在恢复，请等它显示后再生成。');
-    // The server verifies this durable baseline before calling the model.
-    await ctx.saveChat();
+    // The server verifies the baseline. For a follow-up it already wrote the tool transcript itself.
+    if (!parent) await ctx.saveChat();
     if (!sameChat(chat, currentChat())) throw new Error('聊天已切换，本次生成已取消。');
     const messages = getContext().chat;
     if (!messages.length) return;
-    const id = ctx.uuidv4();
+    if (parent && parent.history !== historyHash(messages)) throw new Error('工具记录已改变。');
+    const id = parent?.nextId ?? ctx.uuidv4();
     const context = {
         version: RECOVERY_VERSION, type, chat,
+        ...(trackTools ? { toolDepth: toolTurn.depth } : {}),
         characterName: ctx.name2,
         baseLength: messages.length,
         baseHash: sha256(chatFingerprintInput(messages)),
         prefixHash: sha256(chatFingerprintInput(messages.slice(0, -1))),
         baseLast: ['continue', 'swipe'].includes(type) ? structuredClone(messages[messages.length - 1]) : undefined,
     };
-    data.generation_recovery = { id, context };
-    localTasks.set(id, { context, stream: Boolean(data.stream), lastActivity: Date.now() });
+    data.generation_recovery = { id, context, ...(parent ? { parentId: parent.id } : {}) };
+    if (trackTools) toolTurn.handle = () => runToolRound({ id, context, model: data.model });
+    localTasks.set(id, { context, parentId: parent?.id, stream: Boolean(data.stream), lastActivity: Date.now() });
     activeId = id;
     const stream = ctx.streamingProcessor;
     if (data.stream && stream) {
@@ -147,7 +165,7 @@ async function prepareGeneration(data) {
 
 function markCurrentMessage(messageId, final = false) {
     const task = localTasks.get(activeId);
-    if (!task || !sameChat(task.context.chat, currentChat())) return;
+    if (!task || (toolWorker && task.context.toolDepth !== undefined) || !sameChat(task.context.chat, currentChat())) return;
     const ctx = getContext();
     const target = task.context.type === 'normal' || task.context.type === 'regenerate' ? task.context.baseLength : task.context.baseLength - 1;
     const index = messageId ?? target;
@@ -188,9 +206,184 @@ async function showSavedReply(task, saved) {
     pendingApply = undefined;
 }
 
+function cleanReply(context, reply) {
+    const isContinue = context.type === 'continue';
+    let text = isContinue ? (context.baseLast.mes ?? '') + reply.text : reply.text;
+    let reasoning = getRegexedString(reply.reasoning, regex_placement.REASONING);
+    // Use ST's output cleanup where exported, with a conservative regex fallback.
+    if (typeof core.cleanUpMessage === 'function') {
+        text = core.cleanUpMessage({ getMessage: text, isImpersonate: false, isContinue, displayIncompleteSentences: false });
+    } else {
+        text = getRegexedString(text, regex_placement.AI_OUTPUT);
+    }
+    if (getContext().powerUserSettings.trim_spaces) { text = text.trim(); reasoning = reasoning.trim(); }
+    return { text, reasoning };
+}
+
+function toolsEnabled() {
+    return getContext().accountStorage.getItem(TOOL_SETTING) === 'true';
+}
+
+const historyHash = messages => sha256(chatFingerprintInput(messages));
+function toolResultPrefix() {
+    if (accountsEnabled && !currentUser) throw new Error('The current account handle is unavailable.');
+    return `generation-recovery-result:${encodeURIComponent(getCurrentUserHandle())}:`;
+}
+const toolResultKey = id => toolResultPrefix() + id;
+
+function loadToolResult(id) {
+    try {
+        return pendingToolResults.get(id) || JSON.parse(localStorage.getItem(toolResultKey(id)));
+    } catch { return pendingToolResults.get(id); }
+}
+function rememberToolResult(id, value) {
+    pendingToolResults.set(id, value);
+    try { localStorage.setItem(toolResultKey(id), JSON.stringify(value)); } catch { /* A large result can still be delivered from this tab. */ }
+}
+function forgetToolResult(id) {
+    pendingToolResults.delete(id);
+    try { localStorage.removeItem(toolResultKey(id)); } catch { /* Storage is optional. */ }
+}
+
+/** Align only this turn's own streaming placeholder and transcript with the durable chat. */
+async function alignToolChat(task, state) {
+    const ctx = getContext();
+    const hash = historyHash(ctx.chat);
+    if (hash === state.history) return;
+    if (state.committed && ctx.chat.at(-1)?.extra?.generation_tool_parent === task.id
+        && historyHash(ctx.chat.slice(0, -1)) === state.history && historyHash(ctx.chat.slice(-1)) === historyHash([state.committed])) return;
+    const edit = planRecovery(ctx.chat, task.context, task.id, sha256);
+    const replacement = state.intermediate ? [state.intermediate] : [];
+    if (edit.kind === 'already' || edit.index !== state.index || historyHash([...ctx.chat.slice(0, edit.index), ...replacement]) !== state.history) {
+        throw new Error('聊天记录已改变，请打开保存了工具结果的原聊天。');
+    }
+    ctx.chat.splice(edit.index, ctx.chat.length - edit.index, ...replacement);
+    await core.redisplayChat({ startIndex: edit.index, fade: false });
+}
+
+async function runToolRound(task) {
+    if (toolWorker) return;
+    const id = task.id;
+    toolWorker = id;
+    const post = (action, body) => jsonRequest(`${BASE}/${id}/tools/${action}`, 'POST', body);
+    const checkCurrent = () => {
+        const ctx = getContext();
+        if (stoppingTool === id) throw new Error('工具任务已停止。');
+        if (!sameChat(task.context.chat, currentChat()) || !toolsEnabled() || pendingCancels()[id]) throw new Error('工具恢复已暂停，请回到原聊天并启用恢复工具调用。');
+        if (ctx.mainApi !== 'openai' || !ctx.canPerformToolCalls('normal') || ctx.chatCompletionSettings.chat_completion_source !== 'vertexai'
+            || (ctx.chatCompletionSettings.vertexai_auth_mode || 'express') !== 'express' || ctx.getChatCompletionModel() !== task.model) {
+            throw new Error('请切回原来的 Vertex AI 快速模式、模型及函数调用设置。');
+        }
+    };
+    try {
+        const previous = loadToolResult(id);
+        if (previous) {
+            try { await post('finish', previous); } catch (error) { if (error.status !== 409) throw error; }
+            forgetToolResult(id);
+        }
+        checkCurrent();
+        const { task: detail, reply } = await jsonRequest(`${BASE}/${id}/result`);
+        if (!detail.tools || !reply.hasTools) throw new Error('没有待恢复的工具调用。');
+        const output = cleanReply(detail.context, reply);
+        checkCurrent();
+        let state = await post('prepare', output);
+        checkCurrent();
+        await alignToolChat(detail, state);
+        for (let index = state.completed; index < reply.toolCalls.length; index++) {
+            const pendingStart = pendingToolStarts.get(id);
+            if (state.running && pendingStart?.index !== index) return;
+            checkCurrent();
+            const call = reply.toolCalls[index];
+            const manager = getContext().ToolManager;
+            if (!await manager.isToolAvailable(call.name)) throw new Error(`请启用提供 ${call.name} 的扩展，然后恢复此任务。`);
+            checkCurrent();
+            if (historyHash(getContext().chat) !== state.history) throw new Error('聊天记录已改变，工具恢复已暂停。');
+            const ticket = pendingStart?.index === index ? pendingStart.ticket : getContext().uuidv4();
+            pendingToolStarts.set(id, { index, ticket });
+            try {
+                await post('start', { index, ticket, stealth: manager.isStealthTool(call.name) });
+            } catch (error) {
+                if (!isTransient(error)) pendingToolStarts.delete(id);
+                throw error;
+            }
+            // Only a lost permission response is retriable. From here the action may have taken effect.
+            pendingToolStarts.delete(id);
+            checkCurrent();
+            if (historyHash(getContext().chat) !== state.history) throw new Error('聊天记录已改变，工具恢复已暂停。');
+            const data = [[{ id: call.id || `${id}-${index}`, function: { name: call.name, arguments: call.args }, signature: call.signature }]];
+            const result = await manager.invokeFunctionTools(data, { reasoningText: output.reasoning });
+            const invocation = result.invocations[0];
+            if (result.stealthCalls.length && result.errors.length) manager.showToolCallError(result.errors);
+            const stillInChat = sameChat(task.context.chat, currentChat());
+            const receipt = {
+                index, ticket, displayName: invocation?.displayName ?? call.name, result: invocation?.result ?? '',
+                error: Boolean(result.errors.length), history: stillInChat ? historyHash(getContext().chat) : state.history,
+            };
+            rememberToolResult(id, receipt);
+            // Some tools append their own message (for example, an image) before returning.
+            if (stillInChat && receipt.history !== state.history) await getContext().saveChat();
+            try {
+                await post('finish', receipt);
+            } catch (error) {
+                if (error.status === 409) forgetToolResult(id);
+                throw error;
+            }
+            forgetToolResult(id);
+            state.history = receipt.history;
+            state.running = null;
+        }
+        checkCurrent();
+        pendingToolStarts.delete(id);
+        state = await post('prepare', output);
+        checkCurrent();
+        await alignToolChat(detail, state);
+        const ctx = getContext();
+        const message = state.invocations.length ? ctx.ToolManager.createToolInvocationMessage(state.invocations) : undefined;
+        const saved = await post('commit', { message: message && { name: message.name, force_avatar: message.force_avatar, mes: message.mes } });
+        if (saved.stop) return;
+        checkCurrent();
+        const current = historyHash(ctx.chat);
+        if (current !== saved.history) {
+            if (current !== state.history) throw new Error('工具记录已保存，请回到原聊天继续。');
+            ctx.chat.push(saved.message);
+            await ctx.eventSource.emit(ctx.eventTypes.TOOL_CALLS_PERFORMED, saved.message.extra.tool_invocations);
+            checkCurrent();
+            ctx.addOneMessage(saved.message);
+            await ctx.eventSource.emit(ctx.eventTypes.TOOL_CALLS_RENDERED, saved.message.extra.tool_invocations);
+        }
+        checkCurrent();
+        if (historyHash(ctx.chat) !== saved.history) throw new Error('工具记录已改变。');
+        return { id, nextId: saved.nextId, chat: task.context.chat, model: task.model, history: saved.history };
+    } finally {
+        toolWorker = undefined;
+        schedule();
+    }
+}
+
 async function restoreTask(task, automatic = false) {
-    if (restoring || pendingApply || busy() || !sameChat(task.context.chat, currentChat())) return;
-    if (pendingCancels()[task.id]) return;
+    if (restoring || toolWorker || pendingApply || busy() || !sameChat(task.context.chat, currentChat())) return;
+    if (pendingCancels()[task.id] || stoppingTool === task.id) return;
+    if (task.tools) {
+        if (task.tools.running && pendingToolStarts.get(task.id)?.index !== task.tools.running.index) pendingToolStarts.delete(task.id);
+        if (!toolsEnabled() || getContext().onlineStatus === 'no_connection') return;
+        if (task.tools.running && !loadToolResult(task.id) && !pendingToolStarts.has(task.id)) {
+            if (Date.now() - task.updatedAt > 15000) notifyOnce(`tool-pending-${task.id}-${task.tools.running.index}`, `正在等待工具 ${task.tools.running.name} 的结果。若执行页面已关闭，可在扩展设置的「断线恢复」中跳过此工具。`);
+            return;
+        }
+        followupParent = task.id;
+        core.deactivateSendButtons();
+        try {
+            const parent = await runToolRound(task);
+            if (parent) await core.Generate('normal', { automatic_trigger: true, depth: task.context.toolDepth + 1, toolRecoveryParent: parent });
+        } catch (error) {
+            if (!isTransient(error)) notifyOnce(`${task.id}-${error.message}`, error.message);
+        } finally {
+            followupParent = undefined;
+            core.activateSendButtons();
+            schedule(5000);
+        }
+        return;
+    }
     restoring = true;
     const chat = currentChat();
     try {
@@ -201,16 +394,7 @@ async function restoreTask(task, automatic = false) {
         // Recheck local edits after the network waits. /apply checks the on-disk history immediately before writing.
         planRecovery(getContext().chat, detail.context, task.id, sha256);
         if (reply.hasTools || reply.hasImages) throw new Error('这条结果含工具调用或生成媒体，不能自动恢复；可先查看保存的正文。');
-        const isContinue = detail.context.type === 'continue';
-        let text = isContinue ? (detail.context.baseLast.mes ?? '') + reply.text : reply.text;
-        let reasoning = getRegexedString(reply.reasoning, regex_placement.REASONING);
-        // Use ST's output cleanup where exported, with a conservative regex fallback.
-        if (typeof core.cleanUpMessage === 'function') {
-            text = core.cleanUpMessage({ getMessage: text, isImpersonate: false, isContinue, displayIncompleteSentences: false });
-        } else {
-            text = getRegexedString(text, regex_placement.AI_OUTPUT);
-        }
-        if (getContext().powerUserSettings.trim_spaces) { text = text.trim(); reasoning = reasoning.trim(); }
+        const { text, reasoning } = cleanReply(detail.context, reply);
         pendingApply = task;
         const saved = await jsonRequest(`${BASE}/${task.id}/apply`, 'POST', { token, text, reasoning, includeMessage: true });
         localTasks.delete(task.id);
@@ -258,6 +442,15 @@ async function poll() {
         renderTasks(tasks);
         await confirmPendingApply();
         const knownIds = new Set(tasks.map(task => task.id));
+        for (const id of pendingToolStarts.keys()) if (!knownIds.has(id)) pendingToolStarts.delete(id);
+        // Remove browser receipts after another tab discards a task or its server cache expires.
+        try {
+            const prefix = toolResultPrefix();
+            for (let i = localStorage.length - 1; i >= 0; i--) {
+                const key = localStorage.key(i);
+                if (key?.startsWith(prefix) && !knownIds.has(key.slice(prefix.length))) forgetToolResult(key.slice(prefix.length));
+            }
+        } catch { /* Storage is optional. */ }
         if (!busy()) {
             for (const [id, local] of localTasks) {
                 if (!knownIds.has(id) && Date.now() - local.lastActivity > 60000) localTasks.delete(id);
@@ -269,14 +462,17 @@ async function poll() {
                 continue;
             }
             if (task.status !== 'completed' || pendingCancels()[task.id]) continue;
-            // ACK is accepted only if the server finds the completed task marker in the originating JSONL.
-            try {
-                await jsonRequest(`${BASE}/${task.id}/ack`, 'POST', {});
-                localTasks.delete(task.id);
-                if (activeId === task.id) activeId = undefined;
-                schedule(0);
-                continue;
-            } catch (error) { if (error.status !== 409 && error.status !== 404) throw error; }
+            if (!task.tools) {
+                // A text reply is acknowledged only after the marker reaches the original JSONL.
+                try {
+                    await jsonRequest(`${BASE}/${task.id}/ack`, 'POST', {});
+                    localTasks.delete(task.id);
+                    if (activeId === task.id) activeId = undefined;
+                    schedule(0);
+                    continue;
+                } catch (error) { if (error.status !== 409 && error.status !== 404) throw error; }
+            }
+            if (toolWorker || followupParent === task.id) continue;
             const local = localTasks.get(task.id);
             if (busy() && activeId === task.id && Date.now() - task.updatedAt > 15000
                 && Date.now() - (local?.lastActivity ?? 0) > 15000 && sameChat(task.context.chat, currentChat())) {
@@ -289,7 +485,8 @@ async function poll() {
                 schedule();
                 continue;
             }
-            await restoreTask(task, true);
+            if (task.tools) void restoreTask(task, true);
+            else await restoreTask(task, true);
         }
         const awaitingRegistration = [...localTasks.keys()].some(id => !knownIds.has(id));
         if (pendingApply || awaitingRegistration || Object.keys(pendingCancels()).length || tasks.some(task => task.status === 'running')) nextDelay = 5000;
@@ -327,7 +524,8 @@ function renderTasks(tasks) {
         const row = document.createElement('div');
         row.style.marginBottom = '0.75em';
         const title = document.createElement('div');
-        title.textContent = `${task.context.chat.fileName} · ${task.status}`;
+        const status = task.tools ? `工具已完成 ${task.tools.completed}/${task.tools.count}` : task.status;
+        title.textContent = `${task.context.chat.fileName} · ${status}`;
         row.append(title);
         if (task.error) {
             const error = document.createElement('small');
@@ -337,7 +535,7 @@ function renderTasks(tasks) {
         if (task.status === 'running') row.append(button('停止后台生成', () => cancelTask(task.id)));
         if (task.status === 'completed') {
             const restore = button('恢复到当前聊天', () => restoreTask(task));
-            restore.disabled = !sameChat(task.context.chat, currentChat());
+            restore.disabled = !sameChat(task.context.chat, currentChat()) || Boolean(task.tools && (!toolsEnabled() || (task.tools.running && !loadToolResult(task.id))));
             row.append(restore, button('查看保存的正文', async () => {
                 const { reply } = await jsonRequest(`${BASE}/${task.id}/result`);
                 const preview = document.createElement('textarea');
@@ -348,6 +546,19 @@ function renderTasks(tasks) {
                 row.append(preview);
             }));
         }
+        if (task.tools?.running) {
+            const { index, name } = task.tools.running;
+            const status = document.createElement('small');
+            status.textContent = `正在等待工具 ${name} 的结果。`;
+            row.append(status, button('跳过此工具并继续', async () => {
+                if (!window.confirm(`请先确认执行 ${name} 的页面已经关闭。跳过后会告诉模型结果未知，迟到的结果会被忽略。继续吗？`)) return;
+                await jsonRequest(`${BASE}/${task.id}/tools/skip`, 'POST', { index });
+                forgetToolResult(task.id);
+                pendingToolStarts.delete(task.id);
+                schedule(0);
+            }));
+        }
+        if (task.tools && task.status === 'completed') row.append(button('停止工具任务', () => cancelTask(task.id)));
         if (task.status !== 'running') row.append(button('丢弃缓存', async () => {
             if (!window.confirm('只删除这条后台任务的缓存，不删除聊天记录。确定继续？')) return;
             await jsonRequest(`${BASE}/${task.id}/discard`, 'POST', {});
@@ -363,18 +574,24 @@ function mountPanel() {
     if (!parent) return;
     panel = document.createElement('div');
     panel.className = 'inline-drawer';
-    panel.innerHTML = '<div class="inline-drawer-toggle inline-drawer-header"><b>断线恢复 / Generation recovery</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><small>Vertex AI 快速模式：浏览器断线后继续生成，回到原聊天时恢复最终文本。支持普通回复、重生成、续写、滑动重抽；不接管群聊、后台 quiet 请求、工具调用或生成媒体。完成结果缓存 24 小时。</small><div class="generation-recovery-controls"></div><div class="generation-recovery-list"></div></div>';
+    panel.innerHTML = '<div class="inline-drawer-toggle inline-drawer-header"><b>断线恢复 / Generation recovery</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div><div class="inline-drawer-content"><small>Vertex AI 快速模式：浏览器断线后继续生成，回到原聊天时恢复最终文本。支持普通回复、重生成、续写、滑动重抽；完成结果缓存 24 小时。</small><label class="checkbox_label"><input class="generation-recovery-tools" type="checkbox"><span>恢复工具调用</span></label><small>回到原聊天后继续执行待处理工具。已开始但结果未知的工具会暂停，等你处理。</small><div class="generation-recovery-controls"></div><div class="generation-recovery-list"></div></div>';
+    const checkbox = panel.querySelector('.generation-recovery-tools');
+    checkbox.checked = toolsEnabled();
+    checkbox.addEventListener('change', () => {
+        getContext().accountStorage.setItem(TOOL_SETTING, String(checkbox.checked));
+        schedule(0);
+    });
     panel.querySelector('.generation-recovery-controls').append(button('立即检查', () => poll()));
     parent.append(panel);
 }
 
 const { eventSource, eventTypes } = getContext();
 eventSource.on(eventTypes.GENERATION_STARTED, (type, options, dryRun) => {
-    if (!dryRun && type !== 'quiet') activeId = undefined;
+    if (!dryRun && type !== 'quiet') activeId = options?.toolRecoveryParent?.id;
 });
-eventSource.on(eventTypes.CHAT_COMPLETION_SETTINGS_READY, async (data, preparation) => {
+eventSource.on(eventTypes.CHAT_COMPLETION_REQUEST_READY, async (data, preparation, toolTurn) => {
     try {
-        await prepareGeneration(data);
+        await prepareGeneration(data, toolTurn);
     } catch (error) {
         // EventEmitter logs listener exceptions and continues. Explicitly cancel before the model request is sent.
         preparation?.abort(error);
@@ -388,11 +605,19 @@ eventSource.on(eventTypes.MESSAGE_EDITED, id => {
     if (message?.extra?.generation_task_id && !message.extra.generation_task_complete) message.extra.generation_task_edited = true;
 });
 eventSource.on(eventTypes.GENERATION_STOPPED, () => {
-    if (!internalStop && activeId && localTasks.has(activeId)) void cancelTask(activeId);
+    if (internalStop) return;
+    const task = localTasks.get(activeId);
+    const id = toolWorker || (task && activeId) || followupParent;
+    if (id) void cancelTask(id);
+    if (task?.parentId && task.parentId !== id) void cancelTask(task.parentId);
 });
 eventSource.on(eventTypes.GENERATION_ENDED, () => schedule());
 eventSource.on(eventTypes.CHAT_CHANGED, () => schedule(0));
-eventSource.on(eventTypes.APP_READY, () => { mountPanel(); schedule(); });
+eventSource.on(eventTypes.APP_READY, () => {
+    mountPanel();
+    if (panel) panel.querySelector('.generation-recovery-tools').checked = toolsEnabled();
+    schedule();
+});
 window.addEventListener('online', () => schedule(0));
 window.addEventListener('pageshow', () => schedule(0));
 window.addEventListener('focus', () => schedule(0));

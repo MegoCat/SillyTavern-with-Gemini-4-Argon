@@ -80,17 +80,22 @@ export function planRecovery(messages, context, id, hash) {
 
 /** Parse a complete Vertex response, retaining all text parts and the opaque signature. */
 export function parseVertexReply(body, stream) {
-    const result = { text: '', reasoning: '', signature: null, finishReason: null, hasTools: false, hasImages: false };
+    const result = { text: '', reasoning: '', signature: null, finishReason: null, hasTools: false, toolCalls: [], hasImages: false };
     let sawTerminal = !stream;
     const consumeParts = (parts) => {
         for (const part of parts ?? []) {
-            if (part.functionCall) result.hasTools = true;
+            if (part.functionCall) {
+                const { name, args = {}, id } = part.functionCall;
+                if (typeof name !== 'string' || !name || !args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid Vertex function call.');
+                result.toolCalls.push({ name, args, id, signature: part.thoughtSignature ?? null });
+                result.hasTools = true;
+            }
             if (part.inlineData || part.fileData) result.hasImages = true;
             if (typeof part.text === 'string') {
                 if (part.thought) result.reasoning += part.text;
                 else result.text += part.text;
             }
-            if (part.thoughtSignature && !part.thought) result.signature = part.thoughtSignature;
+            if (part.thoughtSignature && !part.thought && !part.functionCall) result.signature = part.thoughtSignature;
         }
     };
     const consume = (data) => {
@@ -128,8 +133,8 @@ export function parseVertexReply(body, stream) {
 }
 
 /** Build a text message without using the browser's mutable current-chat globals. */
-export function buildRecoveredMessage(context, reply, task, { text = reply.text, reasoning = reply.reasoning } = {}) {
-    if (reply.hasTools || reply.hasImages) throw new Error('Automatic recovery currently supports text replies without tool calls or generated media.');
+export function buildRecoveredMessage(context, reply, task, { text = reply.text, reasoning = reply.reasoning, intermediate = false } = {}) {
+    if ((reply.hasTools && !intermediate) || reply.hasImages) throw new Error('Automatic recovery currently supports text replies without tool calls or generated media.');
     const replacing = context.type === 'continue' || context.type === 'swipe';
     const message = replacing ? structuredClone(context.baseLast) : {
         name: context.characterName,
@@ -165,7 +170,7 @@ export function buildRecoveredMessage(context, reply, task, { text = reply.text,
         message.swipes = [text];
         message.swipe_info = [];
     }
-    markTask(message, task.id, true);
+    markTask(message, task.id, !intermediate);
     message.swipe_info ??= [];
     message.swipe_info[message.swipe_id] = {
         send_date: message.send_date, gen_started: message.gen_started, gen_finished: message.gen_finished,

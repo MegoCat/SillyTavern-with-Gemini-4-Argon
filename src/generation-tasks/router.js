@@ -3,6 +3,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { GenerationTaskStore, hash, taskError, writePrivateFile } from './store.js';
 import { buildRecoveredMessage, chatFingerprintInput, hasCompletedTask, parseVertexReply, planRecovery } from '../../public/scripts/util/generation-recovery.js';
+import { registerToolRoutes } from './tool-round.js';
 
 const stores = new Map();
 const streamEndEvent = 'generation-complete';
@@ -30,6 +31,16 @@ function readTaskChat(request, record, sanitize) {
     const rows = raw.split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
     if (!rows.length || !rows[0].chat_metadata) throw taskError('The original chat header is invalid. No data was changed.', 409);
     return { filename, header: rows[0], messages: rows.slice(1), raw };
+}
+
+function writeTaskChat(request, task, saved) {
+    const content = [saved.header, ...saved.messages].map(row => JSON.stringify(row)).join('\n');
+    if (content === saved.raw) return;
+    const directory = request.user.directories.backups;
+    fs.mkdirSync(directory, { recursive: true });
+    const backup = path.join(directory, `recovery-${task.id}.jsonl`);
+    if (!fs.existsSync(backup)) writePrivateFile(backup, saved.raw);
+    writePrivateFile(saved.filename, content);
 }
 
 /** Client disconnection only detaches this subscriber; it never closes the virtual upstream socket. */
@@ -96,6 +107,8 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         }
     };
 
+    registerToolRoutes(router, route, storeFor, (req, task) => readTaskChat(req, task, sanitize), writeTaskChat);
+
     router.get('/recovery', route((req, res) => res.json({ tasks: storeFor(req).list() })));
     router.get('/recovery/:id', route((req, res) => {
         const store = storeFor(req);
@@ -120,6 +133,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         const { messages } = readTaskChat(req, task, sanitize);
         const index = messages.findIndex(message => hasCompletedTask(message, task.id));
         if (index < 0) throw taskError('The reply has not been saved to the original chat yet.', 409);
+        if (task.toolRound) throw taskError('A tool round must finish before acknowledgement.', 409);
         if (!task.acknowledged) store.acknowledge(task.id);
         if (req.body?.includeMessage && index === messages.length - 1) {
             const prefixHash = task.context.baseLast ? task.context.prefixHash : task.context.baseHash;
@@ -136,7 +150,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
     router.post('/recovery/:id/apply', route((req, res) => {
         const store = storeFor(req);
         const task = store.require(req.params.id);
-        if (task.status !== 'completed') throw taskError('Only a completed result can be restored.', 409);
+        if (task.toolRound || task.status !== 'completed') throw taskError('Only a completed result can be restored.', 409);
         const saved = readTaskChat(req, task, sanitize);
         const edit = checkedPlan(saved.messages, task.context, task.id);
         if (edit.kind === 'already') {
@@ -162,11 +176,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         if (edit.kind === 'append') saved.messages.push(message);
         else saved.messages[edit.index] = message;
         // No await between reading/checking and replacing the file: the operation is atomic in this server process.
-        const backupDirectory = req.user.directories.backups;
-        fs.mkdirSync(backupDirectory, { recursive: true });
-        const backup = path.join(backupDirectory, `recovery-${task.id}.jsonl`);
-        if (!fs.existsSync(backup)) writePrivateFile(backup, saved.raw);
-        writePrivateFile(saved.filename, [saved.header, ...saved.messages].map(row => JSON.stringify(row)).join('\n'));
+        writeTaskChat(req, task, saved);
         // If acknowledgement fails, the message marker makes a retry idempotent.
         store.acknowledge(task.id);
         res.json({ ok: true, index: edit.index, ...(req.body.includeMessage ? { message } : {}) });
@@ -176,18 +186,27 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         const recovery = req.body?.generation_recovery;
         if (!recovery) return next();
         if (req.body.chat_completion_source !== 'vertexai' || (req.body.vertexai_auth_mode || 'express') !== 'express'
-            || req.body.request_images || req.body.tools?.length) throw taskError('Recovery currently supports Vertex AI Express text chat without function tools.');
+            || req.body.request_images) throw taskError('Recovery requires a Vertex AI Express text request.');
+        if (req.body.tools != null && !Array.isArray(req.body.tools)) throw taskError('Invalid function tool declarations.');
+        if (req.body.tools?.length && recovery.context?.toolDepth === undefined) throw taskError('Tool recovery was not enabled for this request.');
         const body = { ...req.body };
         delete body.generation_recovery;
         if ((body.type || 'normal') !== recovery.context?.type) throw taskError('Recovery generation type does not match the request.');
         if (Buffer.byteLength(JSON.stringify(body)) > 32 * 1024 * 1024) throw taskError('This request is too large for background recovery.', 413);
         const store = storeFor(req);
         const existing = store.get(recovery.id);
+        const parent = recovery.parentId && store.require(recovery.parentId);
         if (!existing) {
+            if (parent && (parent.status !== 'completed' || parent.acknowledged || parent.toolRound?.nextId !== recovery.id
+                || parent.toolRound.committedHash !== recovery.context?.baseHash || parent.context.chat.avatar !== recovery.context?.chat?.avatar
+                || parent.context.chat.fileName !== recovery.context?.chat?.fileName || parent.model !== body.model
+                || body.type !== 'normal' || recovery.context.toolDepth !== parent.context.toolDepth + 1)) {
+                throw taskError('The tool follow-up no longer matches the saved conversation.', 409);
+            }
             // Normal delivery may already be saved before the browser's acknowledgement poll runs.
             // Do not make immediate follow-up/auto-continue requests wait for that poll.
             for (const previous of store.records.values()) {
-                if (previous.status !== 'completed' || previous.acknowledged
+                if (previous.status !== 'completed' || previous.acknowledged || previous.toolRound
                     || previous.context.chat.avatar !== recovery.context?.chat?.avatar
                     || previous.context.chat.fileName !== recovery.context?.chat?.fileName) continue;
                 const saved = readTaskChat(req, previous, sanitize);
@@ -196,8 +215,13 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
             const running = [...stores.values()].reduce((sum, item) => sum + item.live.size, 0);
             if (running >= 16) throw taskError('The background generation limit was reached.', 429);
         }
+        if (parent && !existing) {
+            const saved = readTaskChat(req, parent, sanitize);
+            if (saved.messages.at(-1)?.extra?.generation_tool_parent !== parent.id
+                || hash(chatFingerprintInput(saved.messages)) !== parent.toolRound.committedHash) throw taskError('The saved tool transcript has changed.', 409);
+        }
         // create validates metadata and writes it before an upstream request can incur charges.
-        const { record, created } = store.create(recovery.id, recovery.context, body);
+        const { record, created } = store.create(recovery.id, recovery.context, body, parent);
         if (!created) return attachTaskResponse(store, record, res);
         try {
             const saved = readTaskChat(req, record, sanitize);
@@ -207,6 +231,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
             store.acknowledge(record.id);
             throw error;
         }
+        if (parent) store.acknowledge(parent.id);
         const sink = store.makeResponse(record.id);
         const detached = Object.assign(new EventEmitter(), {
             method: 'POST', url: '/generate', originalUrl: '/generate', baseUrl: '',

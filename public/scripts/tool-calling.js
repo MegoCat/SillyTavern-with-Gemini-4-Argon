@@ -344,6 +344,11 @@ export class ToolManager {
         }
     }
 
+    /** Whether the named tool is currently available for a model request. */
+    static async isToolAvailable(name) {
+        return Boolean(await this.#tools.get(name)?.shouldRegister());
+    }
+
     /**
      * Checks if a tool is a stealth tool.
      * @param {string} name The name of the tool to check.
@@ -892,15 +897,9 @@ export class ToolManager {
         return detailsElement.outerHTML;
     }
 
-    /**
-     * Saves function tool invocations to the last user chat message extra metadata.
-     * @param {ToolInvocation[]} invocations Successful tool invocations
-     */
-    static async saveFunctionToolInvocations(invocations) {
-        if (!Array.isArray(invocations) || invocations.length === 0) {
-            return;
-        }
-        const message = {
+    /** Build the same tool transcript for live delivery and recovery. */
+    static createToolInvocationMessage(invocations) {
+        return {
             name: systemUserName,
             force_avatar: system_avatar,
             is_system: true,
@@ -913,6 +912,15 @@ export class ToolManager {
                 model: getGeneratingModel(),
             },
         };
+    }
+
+    /**
+     * Saves function tool invocations as a system message.
+     * @param {ToolInvocation[]} invocations Successful tool invocations
+     */
+    static async saveFunctionToolInvocations(invocations) {
+        if (!Array.isArray(invocations) || invocations.length === 0) return;
+        const message = ToolManager.createToolInvocationMessage(invocations);
         chat.push(message);
         await eventSource.emit(event_types.TOOL_CALLS_PERFORMED, invocations);
         addOneMessage(message);

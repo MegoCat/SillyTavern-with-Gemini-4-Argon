@@ -45,9 +45,11 @@ export function validateContext(context) {
     if (typeof context.characterName !== 'string' || context.characterName.length > 512) throw taskError('Invalid recovery character name.');
     if (['continue', 'swipe'].includes(context.type) && (!context.baseLast || context.baseLast.is_user)) throw taskError('Recovery needs an assistant message to continue or swipe.');
     if (Buffer.byteLength(JSON.stringify(context)) > 1024 * 1024) throw taskError('Recovery metadata is too large.', 413);
+    if (context.toolDepth !== undefined && (!Number.isSafeInteger(context.toolDepth) || context.toolDepth < 0 || context.toolDepth > 50)) throw taskError('Invalid tool recursion depth.');
     // Whitelist fields; do not accidentally persist request secrets added by an extension.
     return {
         version: RECOVERY_VERSION, type: context.type,
+        ...(context.toolDepth !== undefined ? { toolDepth: context.toolDepth } : {}),
         chat: { avatar: context.chat.avatar, fileName: context.chat.fileName },
         baseLength: context.baseLength, baseHash: context.baseHash, prefixHash: context.prefixHash,
         characterName: context.characterName,
@@ -55,7 +57,7 @@ export function validateContext(context) {
     };
 }
 
-/** A bounded per-user spool. Only final results survive a server restart. */
+/** A bounded per-user spool. Completed model replies and tool checkpoints survive a server restart. */
 export class GenerationTaskStore {
     constructor(directory, options = {}) {
         this.directory = directory;
@@ -80,6 +82,11 @@ export class GenerationTaskStore {
                 console.warn(`Could not load recovery task ${file}: ${error.message}`);
             }
         }
+        // A crash can land between persisting a child and retiring its parent.
+        for (const record of this.records.values()) {
+            const parent = this.records.get(record.parentId);
+            if (parent?.toolRound?.nextId === record.id && !parent.acknowledged) this.acknowledge(parent.id);
+        }
         this.prune();
     }
 
@@ -94,6 +101,12 @@ export class GenerationTaskStore {
     summary(record, full = false) {
         const summary = { ...record };
         delete summary.fingerprint;
+        delete summary.offeredTools;
+        delete summary.toolRound;
+        if (record.toolRound && !record.acknowledged && record.status === 'completed') {
+            const { steps, running, count } = record.toolRound;
+            summary.tools = { completed: steps.length, count, running: running ? { index: steps.length, name: running.name } : null };
+        }
         if (!full) {
             summary.context = { ...summary.context };
             delete summary.context.baseLast;
@@ -115,17 +128,17 @@ export class GenerationTaskStore {
             this.leases.delete(record.id);
         }
     }
-    create(id, context, requestBody) {
+    create(id, context, requestBody, parent = null) {
         validateId(id);
         context = validateContext(context);
-        const fingerprint = hash(stableStringify({ context, requestBody }));
+        const fingerprint = hash(stableStringify({ context, requestBody, ...(parent ? { parentId: parent.id } : {}) }));
         const existing = this.get(id);
         if (existing) {
             if (existing.fingerprint !== fingerprint) throw taskError('This task ID was already used for a different request.', 409);
             return { record: existing, created: false };
         }
         this.prune();
-        const pending = [...this.records.values()].filter(record => !record.acknowledged);
+        const pending = [...this.records.values()].filter(record => !record.acknowledged && record !== parent);
         const running = pending.filter(record => record.status === 'running');
         if (running.length >= this.options.maxRunning) throw taskError('Too many background generations. Stop an existing task first.', 429);
         if (pending.length >= this.options.maxPending || pending.reduce((sum, record) => sum + (record.status === 'running' ? this.options.maxBytes : (record.bytes ?? 0)), 0) + this.options.maxBytes > this.options.maxStoredBytes) {
@@ -137,6 +150,8 @@ export class GenerationTaskStore {
         }
         const record = {
             id, context, fingerprint, status: 'running', stream: Boolean(requestBody.stream),
+            ...(context.toolDepth !== undefined ? { offeredTools: (requestBody.tools ?? []).map(tool => tool.function?.name).filter(name => typeof name === 'string') } : {}),
+            ...(parent ? { parentId: parent.id } : {}),
             model: String(requestBody.model ?? ''), createdAt: Date.now(), updatedAt: Date.now(),
             bytes: 0, responseStatus: 200, acknowledged: false,
         };
@@ -158,7 +173,13 @@ export class GenerationTaskStore {
         record.bytes = body.length;
         try {
             if (!error && sink.statusCode >= 400) error = new Error(`The model request failed (HTTP ${sink.statusCode}).`);
-            if (!error) parseVertexReply(body.toString('utf8'), record.stream);
+            if (!error) {
+                const reply = parseVertexReply(body.toString('utf8'), record.stream);
+                if (record.context.toolDepth !== undefined && reply.hasTools) {
+                    if (reply.hasImages || reply.toolCalls.some(call => !record.offeredTools.includes(call.name))) throw new Error('The model returned media or an undeclared function tool.');
+                    record.toolRound = { nextId: randomUUID(), count: reply.toolCalls.length, steps: [] };
+                }
+            }
         } catch (parseError) { error = parseError; }
         record.status = error ? 'failed' : 'completed';
         record.updatedAt = Date.now();
@@ -203,6 +224,8 @@ export class GenerationTaskStore {
         const record = this.require(id);
         if (record.status === 'running') throw taskError('Stop a running task before discarding it.', 409);
         record.acknowledged = true;
+        delete record.toolRound;
+        delete record.offeredTools;
         record.updatedAt = Date.now();
         this.persist(record);
         fs.rmSync(this.file(id, 'body'), { force: true });

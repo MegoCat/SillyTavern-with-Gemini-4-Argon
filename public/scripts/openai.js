@@ -3138,7 +3138,7 @@ export async function createGenerationParameters(settings, model, type, messages
  * @returns {Promise<unknown>}
  * @throws {Error}
  */
-async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } = {}) {
+async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, toolTurn } = {}) {
     // Provide default abort signal
     if (!signal) {
         signal = new AbortController().signal;
@@ -3149,6 +3149,17 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
     const preparation = new AbortController();
     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data, preparation);
     preparation.signal.throwIfAborted();
+    // Determine recoverability after all extensions have finished configuring tools and media.
+    await eventSource.emit(event_types.CHAT_COMPLETION_REQUEST_READY, generate_data, preparation, toolTurn);
+    preparation.signal.throwIfAborted();
+    if (toolTurn?.parent && (generate_data.generation_recovery?.parentId !== toolTurn.parent.id
+        || generate_data.chat_completion_source !== 'vertexai' || generate_data.model !== toolTurn.parent.model)) {
+        throw new Error('工具恢复需要原来的 Vertex AI 快速模式和模型。');
+    }
+    if (toolTurn?.handle && !toolTurn.allowed) {
+        delete generate_data.tools;
+        delete generate_data.tool_choice;
+    }
 
     const generate_url = '/api/backends/chat-completions/generate';
     const response = await fetch(generate_url, {
@@ -3194,6 +3205,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
                     text += getStreamingReply(parsed, state);
                 }
 
+                if (toolTurn?.handle && parsed.candidates?.[0]?.content?.parts?.some(part => part.functionCall)) toolTurn.detected = true;
                 ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
 
                 yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };

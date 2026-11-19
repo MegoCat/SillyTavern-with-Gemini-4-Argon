@@ -4275,6 +4275,7 @@ function removeLastMessage() {
  * @property {AbortSignal} [signal] Abort signal to cancel the generation. If not provided, will create a new AbortController.
  * @property {string} [quietImage] Image URL to use for the quiet prompt (defaults to empty string)
  * @property {string} [quietName] Name to use for the quiet prompt (defaults to "System:")
+ * @property {object} [toolRecoveryParent] Saved tool turn to continue after reconnecting.
  * @property {number} [depth] Recursion depth for the generation. Used to prevent infinite loops in tool calls.
  * @property {JsonSchema} [jsonSchema] JSON schema to use for the structured generation. Usually requires a special instruction.
  */
@@ -4287,7 +4288,8 @@ function removeLastMessage() {
  * @param {boolean} dryRun Whether to actually generate a message or just assemble the prompt
  * @returns {Promise<any>} Returns a promise that resolves when the text is done generating.
  */
-export async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, jsonSchema = null, depth = 0 } = {}, dryRun = false) {
+export async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, jsonSchema = null, depth = 0, toolRecoveryParent } = {}, dryRun = false) {
+    if (toolRecoveryParent && main_api !== 'openai') throw new Error('工具恢复需要原来的 Vertex AI 快速模式。');
     console.log('Generate entered');
     setGenerationProgress(0);
     generation_started = new Date();
@@ -4296,7 +4298,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
     await unshallowCharacter(this_chid);
 
     // Occurs every time, even if the generation is aborted due to slash commands execution
-    await eventSource.emit(event_types.GENERATION_STARTED, type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage }, dryRun);
+    await eventSource.emit(event_types.GENERATION_STARTED, type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, toolRecoveryParent }, dryRun);
 
     // Don't recreate abort controller if signal is passed
     if (!(abortController && signal)) {
@@ -4493,6 +4495,17 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
     // Collect messages with usable content
     const canUseTools = ToolManager.isToolCallingSupported();
     const canPerformToolCalls = !dryRun && ToolManager.canPerformToolCalls(type) && depth < ToolManager.RECURSE_LIMIT;
+    const toolTurn = { depth, parent: toolRecoveryParent, allowed: canPerformToolCalls, handle: null, detected: false };
+    const requestOptions = { jsonSchema, toolTurn };
+    async function finishTrackedTools() {
+        streamingProcessor = null;
+        try {
+            const parent = await toolTurn.handle();
+            if (parent) return await Generate('normal', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth: depth + 1, toolRecoveryParent: parent });
+        } finally {
+            unblockGeneration(type);
+        }
+    }
     let coreChat = chat.filter(x => !x.is_system || (canUseTools && Array.isArray(x.extra?.tool_invocations)));
     if (type === 'swipe') {
         coreChat.pop();
@@ -5390,7 +5403,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 streamingProcessor.firstMessageText = '';
             }
 
-            streamingProcessor.generator = await sendStreamingRequest(type, generate_data, { jsonSchema });
+            streamingProcessor.generator = await sendStreamingRequest(type, generate_data, requestOptions);
 
             hideSwipeButtons();
             let getMessage = await streamingProcessor.generate();
@@ -5407,6 +5420,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
             const isStreamFinished = streamingProcessor && !streamingProcessor.isStopped && streamingProcessor.isFinished;
             const isStreamWithToolCalls = streamingProcessor && Array.isArray(streamingProcessor.toolCalls) && streamingProcessor.toolCalls.length;
+            if (isStreamFinished && toolTurn.handle && toolTurn.detected) {
+                return { trackedToolResult: await finishTrackedTools() };
+            }
             if (canPerformToolCalls && isStreamFinished && isStreamWithToolCalls) {
                 const lastMessage = chat[chat.length - 1];
                 const hasToolCalls = ToolManager.hasToolCalls(streamingProcessor.toolCalls);
@@ -5446,7 +5462,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 });
             }
         } else {
-            return await sendGenerationRequest(type, generate_data, { jsonSchema });
+            return await sendGenerationRequest(type, generate_data, requestOptions);
         }
     }
 
@@ -5460,6 +5476,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      */
     async function onSuccess(data) {
         if (!data) return;
+
+        if (toolTurn.handle && Object.hasOwn(data, 'trackedToolResult')) return data.trackedToolResult;
+        if (toolTurn.handle && data.responseContent?.parts?.some(part => part.functionCall)) return finishTrackedTools();
 
         if (data?.fromStream) {
             return data;
@@ -6103,6 +6122,7 @@ function setInContextMessages(msgInContextCount, type) {
 /**
  * @typedef {object} AdditionalRequestOptions
  * @property {JsonSchema} [jsonSchema]
+ * @property {object} [toolTurn] Per-generation handoff for recoverable function calls.
  */
 
 /**

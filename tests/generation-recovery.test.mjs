@@ -372,7 +372,7 @@ async function browserFixture({ handle = 'user', storage = browserStorage(), val
         powerUserSettings: { trim_spaces: true },
         accountStorage: { getItem: key => values.get(key), setItem: (key, value) => values.set(key, value) },
         eventSource: { on: (event, callback) => callbacks.set(event, callback) },
-        eventTypes: Object.fromEntries(['GENERATION_STARTED', 'CHAT_COMPLETION_SETTINGS_READY', 'STREAM_TOKEN_RECEIVED', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'GENERATION_STOPPED', 'GENERATION_ENDED', 'CHAT_CHANGED', 'APP_READY'].map(name => [name, name])),
+        eventTypes: Object.fromEntries(['GENERATION_STARTED', 'CHAT_COMPLETION_REQUEST_READY', 'STREAM_TOKEN_RECEIVED', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'GENERATION_STOPPED', 'GENERATION_ENDED', 'CHAT_CHANGED', 'APP_READY'].map(name => [name, name])),
     };
     const sandbox = {
         core, getContext: () => ctx, sha256: hash, RECOVERY_TYPES: ['normal', 'regenerate', 'continue', 'swipe'], RECOVERY_VERSION: 1,
@@ -400,7 +400,7 @@ async function browserFixture({ handle = 'user', storage = browserStorage(), val
 
 test('browser hooks opt in only eligible requests and never mark a failed stream as complete', async () => {
     const { callbacks, ctx } = await browserFixture();
-    const prepare = callbacks.get('CHAT_COMPLETION_SETTINGS_READY');
+    const prepare = callbacks.get('CHAT_COMPLETION_REQUEST_READY');
     for (const data of [{ type: 'quiet', chat_completion_source: 'vertexai' }, { type: 'normal', chat_completion_source: 'openai' }, { type: 'normal', chat_completion_source: 'vertexai', tools: [{}] }]) {
         await prepare(data); assert.equal(data.generation_recovery, undefined);
     }
@@ -418,7 +418,7 @@ test('browser hooks opt in only eligible requests and never mark a failed stream
 test('the explicit browser stop event sends a separate cancellable task request', async () => {
     const { callbacks, requests } = await browserFixture();
     const data = { type: 'normal', chat_completion_source: 'vertexai', stream: false };
-    await callbacks.get('CHAT_COMPLETION_SETTINGS_READY')(data);
+    await callbacks.get('CHAT_COMPLETION_REQUEST_READY')(data);
     callbacks.get('GENERATION_STOPPED')(); await nextTurn();
     assert.equal(requests.length, 1);
     assert.equal(requests[0].url, `/api/backends/chat-completions/recovery/${data.generation_recovery.id}/cancel`);
@@ -431,7 +431,7 @@ test('switching chats during preparation aborts an eligible request before dispa
     page.ctx.saveChat = async () => { page.ctx.chatId = 'Other chat'; };
     const preparation = new AbortController();
     const data = { type: 'normal', chat_completion_source: 'vertexai' };
-    await page.callbacks.get('CHAT_COMPLETION_SETTINGS_READY')(data, preparation);
+    await page.callbacks.get('CHAT_COMPLETION_REQUEST_READY')(data, preparation);
     assert.ok(preparation.signal.aborted);
     assert.equal(data.generation_recovery, undefined);
 });
@@ -442,7 +442,7 @@ test('a continuation disconnected before the first token can replace its own pla
     const stream = { messageId: -1, abortController: new AbortController() };
     page.ctx.streamingProcessor = stream;
     const data = { type: 'continue', chat_completion_source: 'vertexai', stream: true };
-    await page.callbacks.get('CHAT_COMPLETION_SETTINGS_READY')(data);
+    await page.callbacks.get('CHAT_COMPLETION_REQUEST_READY')(data);
     stream.messageId = 1;
     page.ctx.chat[1].mes += '...';
     stream.abortController.abort();
@@ -488,7 +488,7 @@ test('an offline stop survives a fresh page and only the originating account ret
     const storage = browserStorage();
     const offline = await browserFixture({ storage, respond: () => { throw new TypeError('Offline'); } });
     const data = { type: 'normal', chat_completion_source: 'vertexai', stream: true };
-    await offline.callbacks.get('CHAT_COMPLETION_SETTINGS_READY')(data);
+    await offline.callbacks.get('CHAT_COMPLETION_REQUEST_READY')(data);
     offline.callbacks.get('GENERATION_STOPPED')();
     await nextTurn();
     assert.equal(storage.length, 1);
@@ -554,4 +554,134 @@ test('a local edit during the claim is preserved and prevents apply', async () =
     await page.tick();
     assert.equal(page.ctx.chat[0].mes, 'User edit');
     assert.ok(!page.requests.some(req => req.url.endsWith('/apply')));
+});
+
+test('tool recovery is a separate account setting and respects the existing provider and generation scope', async () => {
+    const values = new Map();
+    const page = await browserFixture({ values });
+    const prepare = page.callbacks.get('CHAT_COMPLETION_REQUEST_READY');
+    const data = { chat_completion_source: 'vertexai', tools: [{ type: 'function', function: { name: 'dice' } }] };
+    const turn = { depth: 0, allowed: true };
+    await prepare(data, null, turn);
+    assert.equal(data.generation_recovery, undefined);
+    values.set('generation-recovery-tools', 'true');
+    await prepare(data, null, turn);
+    assert.equal(data.generation_recovery.context.toolDepth, 0);
+    assert.equal(typeof turn.handle, 'function');
+    for (const override of [{ type: 'quiet' }, { request_images: true }, { vertexai_auth_mode: 'full' }]) {
+        const other = { ...data, ...override, generation_recovery: undefined };
+        await prepare(other, null, turn);
+        assert.equal(other.generation_recovery, undefined);
+    }
+});
+
+function makeToolJob(app) {
+    const job = app.generate(randomUUID(), false);
+    job.body.generation_recovery.context.toolDepth = 0;
+    job.body.tools = [{ type: 'function', function: { name: 'dice' } }];
+    job.post = async (action, body = {}) => (await app.call('POST', `/recovery/${job.id}/tools/${action}`, body)).response;
+    job.start = async (index, stealth = false) => {
+        const ticket = randomUUID();
+        const response = await job.post('start', { index, stealth, ticket });
+        return { response, ticket };
+    };
+    return job;
+}
+const toolParts = [
+    { text: 'Rolling dice', thoughtSignature: 'text-sig' },
+    { functionCall: { name: 'dice', args: { sides: 6 }, id: 'vertex-call-id' }, thoughtSignature: 'first-call-sig' },
+    { functionCall: { name: 'dice', args: { sides: 3 } } },
+];
+
+test('tool calls survive SSE chunk boundaries with separate ordered IDs, arguments and signatures', () => {
+    const event = part => `data: ${JSON.stringify({ candidates: [{ content: { parts: [part] } }] })}\n\n`;
+    const reply = parseVertexReply(toolParts.map(event).join('') + 'data: {"candidates":[{"finishReason":"STOP"}]}\n\n', true);
+    assert.equal(reply.signature, 'text-sig');
+    assert.deepEqual(reply.toolCalls, [
+        { name: 'dice', args: { sides: 6 }, id: 'vertex-call-id', signature: 'first-call-sig' },
+        { name: 'dice', args: { sides: 3 }, id: undefined, signature: null },
+    ]);
+});
+
+test('competing tabs, lost receipts and a skipped unknown outcome produce one transcript and one follow-up', async t => {
+    let modelCalls = 0;
+    const app = routerFixture(t, (_req, sink) => {
+        if (++modelCalls === 1) sink.json({ responseContent: { parts: toolParts } });
+        else sink.json(JSON.parse(replyJSON()));
+    });
+    const job = makeToolJob(app);
+    await app.call('POST', '/generate', job.body); await nextTurn();
+    const cleaned = { text: 'Rolling dice', reasoning: '' };
+    const firstState = (await job.post('prepare', cleaned)).data();
+    assert.equal(firstState.intermediate.extra.generation_task_complete, false);
+    assert.deepEqual((await job.post('prepare', cleaned)).data(), firstState);
+    assert.equal((await app.call('POST', `/recovery/${job.id}/ack`)).response.statusCode, 409);
+    const starts = await Promise.all([job.start(0), job.start(0)]);
+    assert.deepEqual(starts.map(r => r.response.statusCode), [200, 409]);
+    assert.equal((await job.post('start', { index: 0, ticket: starts[0].ticket })).statusCode, 200);
+    const receipt = { index: 0, ticket: starts[0].ticket, displayName: 'Dice', result: '6', history: firstState.history };
+    assert.equal((await job.post('finish', { ...receipt, ticket: randomUUID() })).statusCode, 409);
+    assert.equal((await job.post('finish', receipt)).statusCode, 200);
+    assert.equal((await job.post('finish', receipt)).statusCode, 200);
+    const restart = new GenerationTaskStore(path.join(app.root, 'generation-tasks'));
+    assert.equal(restart.get(job.id).toolRound.steps[0].result, '6');
+    const second = await job.start(1);
+    assert.equal((await job.post('prepare', cleaned)).data().running, 'dice');
+    assert.equal((await job.start(1)).response.statusCode, 409);
+    assert.equal((await job.post('skip', { index: 1 })).statusCode, 200);
+    assert.equal((await job.post('finish', { ...receipt, index: 1, ticket: second.ticket })).statusCode, 409);
+    const message = { name: 'System', force_avatar: 'img/five.png', mes: 'Tools' };
+    const saved = (await job.post('commit', { message })).data();
+    assert.deepEqual((await job.post('commit', { message })).data(), saved);
+    assert.equal(saved.message.extra.tool_invocations[0].signature, 'first-call-sig');
+    assert.equal(saved.message.extra.tool_invocations[0].id, 'vertex-call-id');
+    assert.equal(saved.message.extra.tool_invocations[1].id, `${job.id}-1`);
+    assert.match(saved.message.extra.tool_invocations[1].result, /unknown/);
+    const rows = fs.readFileSync(app.filename, 'utf8').split('\n').map(JSON.parse);
+    assert.equal(rows.length, 4);
+    const child = app.generate(saved.nextId, false);
+    child.body.generation_recovery = { id: saved.nextId, parentId: job.id, context: { ...context(rows.slice(1)), toolDepth: 1 } };
+    const forged = structuredClone(child.body); forged.model = 'wrong model';
+    assert.equal((await app.call('POST', '/generate', forged)).response.statusCode, 409);
+    await app.call('POST', '/generate', child.body);
+    await app.call('POST', '/generate', child.body);
+    await nextTurn();
+    assert.equal(modelCalls, 2);
+    assert.deepEqual((await app.call('GET', '/recovery')).response.data().tasks.map(t => t.id), [child.id]);
+});
+
+test('recoverable tools reject changed chats and stop exactly once for stealth tools', async t => {
+    const app = routerFixture(t, (_req, sink) => sink.json({ responseContent: { parts: [toolParts[1]] } }));
+    const job = makeToolJob(app);
+    await app.call('POST', '/generate', job.body); await nextTurn();
+    const state = (await job.post('prepare', { text: '', reasoning: '' })).data();
+    assert.equal(state.intermediate, null);
+    const before = fs.readFileSync(app.filename, 'utf8');
+    fs.appendFileSync(app.filename, '\n' + JSON.stringify(userMessage()));
+    assert.equal((await job.start(0)).response.statusCode, 409);
+    fs.writeFileSync(app.filename, before);
+    const { ticket } = await job.start(0, true);
+    await job.post('finish', { index: 0, ticket, displayName: 'Dice', result: '', history: state.history });
+    assert.deepEqual((await job.post('commit')).data(), { stop: true });
+    assert.equal(fs.readFileSync(app.filename, 'utf8'), before);
+    assert.equal((await job.start(0)).response.statusCode, 409);
+    assert.equal((await app.call('GET', '/recovery')).response.data().tasks.length, 0);
+});
+
+test('only explicitly offered tools can be recovered, and cancellation rejects late receipts', async t => {
+    const app = routerFixture(t, (_req, sink) => sink.json({ responseContent: { parts: [toolParts[1]] } }));
+    const unsupported = makeToolJob(app);
+    delete unsupported.body.generation_recovery.context.toolDepth;
+    assert.equal((await app.call('POST', '/generate', unsupported.body)).response.statusCode, 400);
+    const wrong = makeToolJob(app);
+    wrong.body.tools[0].function.name = 'other';
+    await app.call('POST', '/generate', wrong.body); await nextTurn();
+    assert.equal((await app.call('GET', `/recovery/${wrong.id}`)).response.data().status, 'failed');
+    const job = makeToolJob(app);
+    await app.call('POST', '/generate', job.body); await nextTurn();
+    await job.post('prepare', { text: '', reasoning: '' });
+    const { ticket } = await job.start(0);
+    await app.call('POST', `/recovery/${job.id}/cancel`);
+    assert.equal((await job.post('finish', { index: 0, ticket })).statusCode, 409);
+    assert.equal((await job.post('commit')).statusCode, 409);
 });
