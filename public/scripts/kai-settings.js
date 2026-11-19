@@ -228,7 +228,7 @@ function tryParseStreamingError(response, decoded) {
 
 export async function generateKoboldWithStreaming(generate_data, signal) {
     const response = await fetch('/api/backends/kobold/generate', {
-        headers: getRequestHeaders(),
+        headers: getRequestHeaders({ isGeneration: true }),
         body: JSON.stringify(generate_data),
         method: 'POST',
         signal: signal,

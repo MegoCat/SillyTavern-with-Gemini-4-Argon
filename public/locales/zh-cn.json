@@ -892,6 +892,8 @@
     "Message Sound": "消息声音",
     "Only play a sound when ST's browser tab is unfocused": "仅在 ST 的浏览器标签页未被打开时播放声音",
     "Background Sound Only": "仅背景声音",
+    "Termux reply notifications": "Termux 回复通知",
+    "termux_notifications_hint": "回复就绪或生成失败时，通知运行酒馆的安卓设备。需要安装 Termux:API 应用和 termux-api 软件包。",
     "Reduce the formatting requirements on API URLs": "减少 API URL 的格式化要求",
     "Relaxed API URLS": "宽松的 API URL",
     "Ask to import the World Info/Lorebook for every new character with embedded lorebook. If unchecked, a brief message will be shown instead": "询问是否为每个具有嵌入的世界书的新角色导入世界书。如果未选中，则会显示简短的消息",

@@ -742,7 +742,7 @@ export async function generateNovelWithStreaming(generate_data, signal) {
     generate_data.streaming = nai_settings.streaming_novel;
 
     const response = await fetch('/api/novelai/generate', {
-        headers: getRequestHeaders(),
+        headers: getRequestHeaders({ isGeneration: true }),
         body: JSON.stringify(generate_data),
         method: 'POST',
         signal: signal,

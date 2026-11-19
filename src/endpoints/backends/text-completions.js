@@ -32,6 +32,7 @@ async function parseOllamaStream(jsonStream, request, response) {
             throw new Error('No body in the response');
         }
 
+        response.locals.observeGenerationStream?.(jsonStream, true);
         let partialData = '';
         jsonStream.body.on('data', (data) => {
             const chunk = data.toString();

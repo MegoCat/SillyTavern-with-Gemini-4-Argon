@@ -2,6 +2,7 @@ import https from 'node:https';
 import http from 'node:http';
 import fs from 'node:fs';
 import { color, urlHostnameToIPv6, getHasIP } from './util.js';
+import { observeGenerationResponse } from './termux-notifications.js';
 
 // Express routers
 import { router as userDataRouter } from './users.js';
@@ -139,6 +140,12 @@ export function redirectDeprecatedEndpoints(app) {
  * @param {import('express').Express} app The Express app to use
  */
 export function setupPrivateEndpoints(app) {
+    app.post([
+        '/api/backends/chat-completions/generate',
+        '/api/backends/text-completions/generate',
+        '/api/backends/kobold/generate',
+        '/api/novelai/generate',
+    ], observeGenerationResponse);
     app.use('/', userDataRouter);
     app.use('/api/users', usersPrivateRouter);
     app.use('/api/users', usersAdminRouter);

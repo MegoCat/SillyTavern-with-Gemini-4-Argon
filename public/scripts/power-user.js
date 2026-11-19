@@ -146,6 +146,7 @@ export const power_user = {
     show_card_avatar_urls: false,
     play_message_sound: false,
     play_sound_unfocused: true,
+    termux_notifications: false,
     auto_save_msg_edits: false,
     confirm_message_delete: true,
 
@@ -1701,6 +1702,7 @@ export async function loadPowerUserSettings(settings, data) {
     $('#auto_continue_target_length').val(power_user.auto_continue.target_length);
     $('#play_message_sound').prop('checked', power_user.play_message_sound);
     $('#play_sound_unfocused').prop('checked', power_user.play_sound_unfocused);
+    $('#termux_notifications').prop('checked', power_user.termux_notifications);
     $('#never_resize_avatars').prop('checked', power_user.never_resize_avatars);
     $('#show_card_avatar_urls').prop('checked', power_user.show_card_avatar_urls);
     $('#auto_save_msg_edits').prop('checked', power_user.auto_save_msg_edits);
@@ -3549,6 +3551,11 @@ jQuery(() => {
 
     $('#play_sound_unfocused').on('input', function () {
         power_user.play_sound_unfocused = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#termux_notifications').on('input', function () {
+        power_user.termux_notifications = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
 

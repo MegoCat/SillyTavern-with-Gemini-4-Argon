@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -174,7 +175,7 @@ class TestResponse extends Writable {
     text() { return Buffer.concat(this.parts).toString('utf8'); }
     data() { return JSON.parse(this.text()); }
 }
-function routerFixture(t, provider) {
+function routerFixture(t, provider, headers = {}) {
     const { root } = fixture(t);
     const directories = { root, chats: path.join(root, 'chats'), backups: path.join(root, 'backups') };
     fs.mkdirSync(path.join(directories.chats, 'Character'), { recursive: true });
@@ -193,7 +194,7 @@ function routerFixture(t, provider) {
         const route = handlers.find(item => item.method === method && new RegExp(`^${item.pattern.replace(':id', '([^/]+)')}$`).test(url));
         assert.ok(route, `Missing route: ${method} ${url}`);
         const match = url.match(new RegExp(`^${route.pattern.replace(':id', '([^/]+)')}$`));
-        const request = Object.assign(new EventEmitter(), { body, user: overrideUser, params: { id: match[1] }, headers: {}, socket: new EventEmitter() });
+        const request = Object.assign(new EventEmitter(), { body, user: overrideUser, params: { id: match[1] }, headers, socket: new EventEmitter() });
         let next = false;
         await route.handler(request, response, () => { next = true; });
         return { request, response, next };
@@ -213,16 +214,21 @@ test('router preserves legacy requests and rejects unauthenticated task access',
 });
 
 test('disconnect during streaming keeps generation alive and restores exactly one final reply', async t => {
+    const notification = t.mock.method(childProcess, 'execFile', () => ({}));
     let upstream; let upstreamClosed = false; let invocations = 0;
     const app = routerFixture(t, (req, sink) => {
         invocations++; req.socket.on('close', () => { upstreamClosed = true; });
         upstream = new PassThrough(); upstream.pipe(sink);
-    });
+    }, { 'x-st-termux-notify': '1' });
     const job = app.generate(); const first = await app.call('POST', '/generate', job.body);
     await nextTurn(); upstream.write(sse('Hello ', false));
     first.request.socket.emit('close'); first.response.destroy();
     assert.equal(upstreamClosed, false);
+    assert.equal(notification.mock.callCount(), 0);
     upstream.end(sse('世界')); await nextTurn();
+    assert.deepEqual(notification.mock.calls[0].arguments.slice(0, 2), [
+        'termux-notification', ['--title', 'SillyTavern', '--content', 'AI 回复已就绪。'],
+    ]);
     const detail = (await app.call('GET', `/recovery/${job.id}/result`)).response.data();
     assert.equal(detail.reply.text, 'Hello 世界'); assert.equal(detail.reply.signature, 'signature==');
     const replay = (await app.call('POST', '/generate', job.body)).response;
@@ -247,6 +253,7 @@ test('disconnect during streaming keeps generation alive and restores exactly on
     assert.deepEqual((await confirm()).response.data(), { ok: true });
     assert.ok(fs.existsSync(path.join(app.user.directories.backups, `recovery-${job.id}.jsonl`)));
     assert.equal((await app.call('GET', '/recovery')).response.data().tasks.length, 0);
+    assert.equal(notification.mock.callCount(), 1);
 });
 
 test('normal delivery carries original HTTP/JSON and ACK waits for an actual saved marker', async t => {
@@ -263,8 +270,9 @@ test('normal delivery carries original HTTP/JSON and ACK waits for an actual sav
 });
 
 test('explicit stop cancels a waiting upstream; immediate stop prevents dispatch entirely', async t => {
+    const notification = t.mock.method(childProcess, 'execFile', () => ({}));
     let invoked = 0; let stopped = false;
-    const app = routerFixture(t, (req) => { invoked++; req.socket.on('close', () => { stopped = true; }); });
+    const app = routerFixture(t, (req) => { invoked++; req.socket.on('close', () => { stopped = true; }); }, { 'x-st-termux-notify': '1' });
     const job = app.generate(); await app.call('POST', '/generate', job.body); await nextTurn();
     await app.call('POST', `/recovery/${job.id}/cancel`);
     assert.equal(stopped, true); assert.equal((await app.call('GET', `/recovery/${job.id}`)).response.data().status, 'cancelled');
@@ -272,6 +280,7 @@ test('explicit stop cancels a waiting upstream; immediate stop prevents dispatch
     const immediate = app.generate(); await app.call('POST', '/generate', immediate.body);
     await app.call('POST', `/recovery/${immediate.id}/cancel`); await nextTurn();
     assert.equal(invoked, 1);
+    assert.equal(notification.mock.callCount(), 0);
 });
 
 test('changed history is never overwritten and a different user cannot read the task', async t => {
@@ -802,13 +811,15 @@ test('ordinary replies to tool requests keep their API fields when the capture f
 });
 
 test('competing tabs, lost receipts and a skipped unknown outcome produce one transcript and one follow-up', async t => {
+    const notification = t.mock.method(childProcess, 'execFile', () => ({}));
     let modelCalls = 0;
     const app = routerFixture(t, (_req, sink) => {
         if (++modelCalls === 1) sink.json({ responseContent: { parts: toolParts } });
         else sink.json(JSON.parse(replyJSON()));
-    });
+    }, { 'x-st-termux-notify': '1' });
     const job = makeToolJob(app);
     await app.call('POST', '/generate', job.body); await nextTurn();
+    assert.equal(notification.mock.callCount(), 0);
     const cleaned = { text: 'Rolling dice', reasoning: '' };
     const firstState = (await job.post('prepare', cleaned)).data();
     assert.equal(firstState.intermediate.extra.generation_task_complete, false);
@@ -845,6 +856,8 @@ test('competing tabs, lost receipts and a skipped unknown outcome produce one tr
     await app.call('POST', '/generate', child.body);
     await nextTurn();
     assert.equal(modelCalls, 2);
+    assert.equal(notification.mock.callCount(), 1);
+    assert.equal(notification.mock.calls[0].arguments[1].at(-1), 'AI 回复已就绪。');
     assert.deepEqual((await app.call('GET', '/recovery')).response.data().tasks.map(t => t.id), [child.id]);
 });
 

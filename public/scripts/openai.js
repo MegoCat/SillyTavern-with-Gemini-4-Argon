@@ -3166,7 +3166,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, to
     const response = await fetch(generate_url, {
         method: 'POST',
         body: JSON.stringify(generate_data),
-        headers: getRequestHeaders(),
+        headers: getRequestHeaders({ isGeneration: type !== 'quiet' }),
         signal: signal,
     });
 

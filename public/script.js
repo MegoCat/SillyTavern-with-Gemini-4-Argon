@@ -644,7 +644,7 @@ export let active_group = '';
 
 export const entitiesFilter = new FilterHelper(printCharactersDebounced);
 
-export function getRequestHeaders({ omitContentType = false } = {}) {
+export function getRequestHeaders({ omitContentType = false, isGeneration = false } = {}) {
     const headers = {
         'Content-Type': 'application/json',
         'X-CSRF-Token': token,
@@ -652,6 +652,10 @@ export function getRequestHeaders({ omitContentType = false } = {}) {
 
     if (omitContentType) {
         delete headers['Content-Type'];
+    }
+
+    if (isGeneration && power_user.termux_notifications) {
+        headers['X-ST-Termux-Notify'] = '1';
     }
 
     return headers;
@@ -6158,12 +6162,12 @@ export async function sendGenerationRequest(type, data, options = {}) {
     }
 
     if (main_api === 'koboldhorde') {
-        return await generateHorde(data.prompt, data, abortController.signal, true);
+        return await generateHorde(data.prompt, data, abortController.signal, true, type !== 'quiet');
     }
 
     const response = await fetch(getGenerateUrl(main_api), {
         method: 'POST',
-        headers: getRequestHeaders(),
+        headers: getRequestHeaders({ isGeneration: type !== 'quiet' }),
         cache: 'no-cache',
         body: JSON.stringify(data),
         signal: abortController.signal,

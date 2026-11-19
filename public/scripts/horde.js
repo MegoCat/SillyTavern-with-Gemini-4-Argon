@@ -67,12 +67,13 @@ async function getModels(force) {
 /**
  * Gets the status of a Horde task.
  * @param {string} taskId Task ID
+ * @param {HeadersInit} headers Request headers for this generation
  * @returns {Promise<Object>} Task status
  */
-async function getTaskStatus(taskId) {
+async function getTaskStatus(taskId, headers) {
     const response = await fetch('/api/horde/task-status', {
         method: 'POST',
-        headers: getRequestHeaders(),
+        headers,
         body: JSON.stringify({ taskId }),
     });
 
@@ -196,10 +197,11 @@ function setContextSizePreview() {
  * @param params
  * @param signal
  * @param reportProgress
+ * @param {boolean} [isGeneration] Whether this is a user-visible generation
  * @returns {Promise<{text: *, workerName: string}>}
  * @throws {Error}
  */
-export async function generateHorde(prompt, params, signal, reportProgress) {
+export async function generateHorde(prompt, params, signal, reportProgress, isGeneration = false) {
     validateHordeModel();
     delete params.prompt;
 
@@ -218,9 +220,10 @@ export async function generateHorde(prompt, params, signal, reportProgress) {
         'models': horde_settings.models,
     };
 
+    const headers = getRequestHeaders({ isGeneration });
     const response = await fetch('/api/horde/generate-text', {
         method: 'POST',
-        headers: getRequestHeaders(),
+        headers,
         body: JSON.stringify(payload),
     });
 
@@ -247,7 +250,7 @@ export async function generateHorde(prompt, params, signal, reportProgress) {
             throw new Error('Request aborted');
         }
 
-        const statusCheckJson = await getTaskStatus(taskId);
+        const statusCheckJson = await getTaskStatus(taskId, headers);
         console.log(statusCheckJson);
 
         if (statusCheckJson.faulted === true) {

@@ -1290,9 +1290,7 @@ export async function generateTextGenWithStreaming(generate_data, signal) {
     generate_data.stream = true;
 
     const response = await fetch('/api/backends/text-completions/generate', {
-        headers: {
-            ...getRequestHeaders(),
-        },
+        headers: getRequestHeaders({ isGeneration: true }),
         body: JSON.stringify(generate_data),
         method: 'POST',
         signal: signal,

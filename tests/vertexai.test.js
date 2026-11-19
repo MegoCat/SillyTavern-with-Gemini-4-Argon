@@ -1,13 +1,15 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, jest, test } from '@jest/globals';
+import childProcess from 'node:child_process';
 import { getEventListeners, once } from 'node:events';
 import http from 'node:http';
 import process from 'node:process';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { generateKeyPairSync } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import nodeFetch from 'node-fetch';
 import { setConfigFilePath } from '../src/util.js';
+import { observeGenerationResponse } from '../src/termux-notifications.js';
 
 setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
 
@@ -29,6 +31,7 @@ describe.each([
 ])('Vertex AI Express %s', (model, maxThinkingLevel, nonStreamingLimit) => {
     let server;
     let baseUrl;
+    let notification;
 
     beforeAll(async () => {
         const { default: express } = await import('express');
@@ -39,6 +42,7 @@ describe.each([
             req.user = { directories: {} };
             next();
         });
+        app.post('/generate', observeGenerationResponse);
         app.use(router);
         server = app.listen(0, '127.0.0.1');
         await new Promise(resolve => server.once('listening', resolve));
@@ -52,24 +56,25 @@ describe.each([
     });
 
     beforeEach(() => {
+        notification = jest.spyOn(childProcess, 'execFile').mockReturnValue({});
         retryDelayMock.mockReset().mockImplementation((_ms, value, options) => delay(1, value, options));
         readSecretMock.mockReset().mockReturnValue('vertex-test-key');
         fetchMock.mockReset().mockImplementation(async () => ({
             ok: true,
             status: 200,
             statusText: 'OK',
-            body: Readable.from(['data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}\n\n']),
+            body: Readable.from(['\uFEFFdata: {"candidates":[{"content":{"parts":[{"text":"Hello"}]},"finishReason":"STOP"}]}\n\n']),
             json: async () => ({ candidates: [{ content: { parts: [{ text: 'Hello' }] } }] }),
         }));
     });
 
     afterEach(() => jest.restoreAllMocks());
 
-    async function generate(overrides = {}, signal) {
+    async function generate(overrides = {}, { signal, notify = false } = {}) {
         return fetch(`${baseUrl}/generate`, {
             method: 'POST',
             signal,
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...(notify && { 'X-ST-Termux-Notify': '1' }) },
             body: JSON.stringify({
                 chat_completion_source: 'vertexai', vertexai_auth_mode: 'express',
                 vertexai_express_project_id: 'test-project',
@@ -87,6 +92,12 @@ describe.each([
             body: Readable.from([text]),
             text: async () => text,
         };
+    }
+
+    function expectOneNotification(content) {
+        expect(notification.mock.calls.map(([command, args]) => [command, ...args])).toEqual([
+            ['termux-notification', '--title', 'SillyTavern', '--content', content],
+        ]);
     }
 
     test.each([false, true])('omits thought signatures from terminal metadata and preserves the web response, stream=%s', async (stream) => {
@@ -176,9 +187,10 @@ describe.each([
         const errors = Array.from({ length: 12 }, () => errorResponse());
         errors.forEach(error => fetchMock.mockResolvedValueOnce(error));
 
-        const response = await generate({ stream });
+        const response = await generate({ stream }, { notify: true });
         expect(response.status).toBe(200);
         expect(await response.text()).toContain('Hello');
+        expectOneNotification('AI 回复已就绪。');
         expect(fetchMock).toHaveBeenCalledTimes(13);
         expect(warnings.mock.calls.filter(([line]) => String(line).includes('429')).length).toBeLessThanOrEqual(1);
         const summaries = logs.mock.calls.filter(([line]) => String(line).includes('done | total'));
@@ -227,17 +239,39 @@ describe.each([
         expect(await response.text()).toContain('Hello');
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(retryDelayMock).toHaveBeenCalledTimes(1);
+        expect(notification).not.toHaveBeenCalled();
     });
 
     test.each([false, true])('stops retrying when a different error follows a 429 with stream=%s', async (stream) => {
         const logs = jest.spyOn(console, 'info').mockImplementation(() => {});
         fetchMock.mockResolvedValueOnce(errorResponse()).mockResolvedValueOnce(errorResponse(503));
-        const response = await generate({ stream });
+        const response = await generate({ stream }, { notify: true });
         expect(response.ok).toBe(false);
         expect((await response.json()).error.code).toBe(503);
         expect(logs.mock.calls.filter(([line]) => String(line).includes('failed | total'))).toHaveLength(1);
+        expectOneNotification('AI 回复生成失败，请打开酒馆查看。');
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(retryDelayMock).toHaveBeenCalledTimes(1);
+    });
+
+    test('waits for the stream and reports an error inside a successful HTTP response', async () => {
+        const body = new PassThrough();
+        fetchMock.mockResolvedValueOnce({ ok: true, status: 200, statusText: 'OK', body });
+        body.write('data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}\r\n\r\n');
+        const response = await generate({ stream: true }, { notify: true });
+        expect(notification).not.toHaveBeenCalled();
+        body.write('data: {"er');
+        body.end('ror":{"message":"Private upstream detail"}}\r\n\r\n');
+        expect(await response.text()).toContain('Private upstream detail');
+        expectOneNotification('AI 回复生成失败，请打开酒馆查看。');
+    });
+
+    test('reports a partial Gemini stream that ends before its finish reason', async () => {
+        const body = Readable.from(['data: {"candidates":[{"content":{"parts":[{"text":"Partial"}]}}]}\n\n']);
+        fetchMock.mockResolvedValueOnce({ ok: true, status: 200, statusText: 'OK', body });
+        const response = await generate({ stream: true }, { notify: true });
+        expect(await response.text()).toContain('Partial');
+        expectOneNotification('AI 回复生成失败，请打开酒馆查看。');
     });
 
     test.each([
@@ -255,9 +289,10 @@ describe.each([
             authRequests = 1;
         }
         fetchMock.mockResolvedValueOnce(errorResponse());
-        const response = await generate({ chat_completion_source: source, vertexai_auth_mode: mode, stream });
+        const response = await generate({ chat_completion_source: source, vertexai_auth_mode: mode, stream }, { notify: true });
         expect(response.ok).toBe(false);
         expect((await response.json()).error.code).toBe(429);
+        expectOneNotification('AI 回复生成失败，请打开酒馆查看。');
         expect(fetchMock).toHaveBeenCalledTimes(authRequests + 1);
         expect(retryDelayMock).not.toHaveBeenCalled();
     });
@@ -272,7 +307,7 @@ describe.each([
         });
         fetchMock.mockResolvedValue(errorResponse());
         const controller = new AbortController();
-        const pending = generate({ stream }, controller.signal).catch(error => error);
+        const pending = generate({ stream }, { signal: controller.signal, notify: true }).catch(error => error);
         const upstreamSignal = await waiting;
         const aborted = once(upstreamSignal, 'abort');
         controller.abort();
@@ -284,6 +319,7 @@ describe.each([
         expect(logs.mock.calls.filter(([line]) => String(line).includes('cancelled | total'))).toHaveLength(1);
         expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(retryDelayMock).toHaveBeenCalledTimes(1);
+        expect(notification).not.toHaveBeenCalled();
     });
 
     test.each([false, true])('cancels an in-flight retry with stream=%s', async (stream) => {
@@ -296,7 +332,7 @@ describe.each([
             });
         });
         const controller = new AbortController();
-        const pending = generate({ stream }, controller.signal).catch(error => error);
+        const pending = generate({ stream }, { signal: controller.signal, notify: true }).catch(error => error);
         const upstreamSignal = await started;
         const aborted = once(upstreamSignal, 'abort');
         controller.abort();
@@ -307,6 +343,7 @@ describe.each([
         expect(upstreamSignal.aborted).toBe(true);
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(retryDelayMock).toHaveBeenCalledTimes(1);
+        expect(notification).not.toHaveBeenCalled();
     });
 
     test.each([

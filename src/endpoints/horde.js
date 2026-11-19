@@ -3,6 +3,7 @@ import express from 'express';
 import { AIHorde, ModelGenerationInputStableSamplers, ModelInterrogationFormTypes, HordeAsyncRequestStates } from '@zeldafan0225/ai_horde';
 import { getVersion, delay, Cache } from '../util.js';
 import { readSecret, SECRET_KEYS } from './secrets.js';
+import { getTermuxNotifier } from '../termux-notifications.js';
 
 const ANONYMOUS_KEY = '0000000000';
 const HORDE_TEXT_MODEL_METADATA_URL = 'https://raw.githubusercontent.com/db0/AI-Horde-text-model-reference/main/db.json';
@@ -162,6 +163,7 @@ router.post('/cancel-task', async (request, response) => {
 });
 
 router.post('/task-status', async (request, response) => {
+    const notify = getTermuxNotifier(request);
     try {
         const taskId = request.body.taskId;
         const agent = await getClientAgent();
@@ -173,14 +175,21 @@ router.post('/task-status', async (request, response) => {
 
         const data = await fetchResult.json();
         console.info(`Horde task ${taskId} status:`, data);
+        if (data?.faulted === true || data?.is_possible === false) {
+            notify?.('failed');
+        } else if (data?.done && Array.isArray(data.generations) && data.generations.length) {
+            notify?.('completed');
+        }
         return response.send(data);
     } catch (error) {
         console.error(error);
+        notify?.('failed');
         response.sendStatus(500);
     }
 });
 
 router.post('/generate-text', async (request, response) => {
+    const notify = getTermuxNotifier(request);
     const apiKey = readSecret(request.user.directories, SECRET_KEYS.HORDE) || ANONYMOUS_KEY;
     const url = 'https://aihorde.net/api/v2/generate/text/async';
     const agent = await getClientAgent();
@@ -200,13 +209,16 @@ router.post('/generate-text', async (request, response) => {
         if (!result.ok) {
             const message = await result.text();
             console.error('Horde returned an error:', message);
+            notify?.('failed');
             return response.send({ error: { message } });
         }
 
         const data = await result.json();
+        if (data?.error) notify?.('failed');
         return response.send(data);
     } catch (error) {
         console.error(error);
+        notify?.('failed');
         return response.send({ error: true });
     }
 });

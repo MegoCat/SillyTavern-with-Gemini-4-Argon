@@ -762,6 +762,7 @@ export async function forwardFetchResponse(from, to, observeStream) {
     }
 
     if (from.body && to.socket) {
+        to.locals?.observeGenerationStream?.(from);
         observeStream?.(from.body);
         from.body.pipe(to);
 

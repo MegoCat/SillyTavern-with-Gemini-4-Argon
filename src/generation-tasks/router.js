@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { GenerationTaskStore, hash, taskError, writePrivateFile } from './store.js';
+import { getTermuxNotifier } from '../termux-notifications.js';
 import { buildRecoveredMessage, chatFingerprintInput, hasCompletedTask, planRecovery } from '../../public/scripts/util/generation-recovery.js';
 import { registerToolRoutes } from './tool-round.js';
 
@@ -249,6 +250,13 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         }
         if (parent) store.acknowledge(parent.id);
         const sink = store.makeResponse(record.id);
+        const notify = getTermuxNotifier(req);
+        if (notify) {
+            sink.once('terminal', task => {
+                if (task.status === 'completed' && task.toolRound) return;
+                notify(task.status);
+            });
+        }
         const detached = Object.assign(new EventEmitter(), {
             method: 'POST', url: '/generate', originalUrl: '/generate', baseUrl: '',
             body, user: req.user, headers: { ...req.headers }, app: req.app,
