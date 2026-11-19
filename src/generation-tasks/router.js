@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { GenerationTaskStore, hash, taskError, writePrivateFile } from './store.js';
-import { buildRecoveredMessage, hasCompletedTask, parseVertexReply, planRecovery } from '../../public/scripts/util/generation-recovery.js';
+import { buildRecoveredMessage, chatFingerprintInput, hasCompletedTask, parseVertexReply, planRecovery } from '../../public/scripts/util/generation-recovery.js';
 
 const stores = new Map();
+const streamEndEvent = 'generation-complete';
 
 function checkedPlan(messages, context, id) {
     try { return planRecovery(messages, context, id, hash); } catch (error) { throw taskError(error.message, 409); }
@@ -39,13 +40,18 @@ export function attachTaskResponse(store, record, response) {
     const headers = () => {
         if (response.headersSent || response.destroyed) return;
         response.statusCode = sink?.statusCode ?? record.responseStatus;
-        response.setHeader('Content-Type', record.stream && response.statusCode < 400 ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8');
+        const streaming = record.stream && response.statusCode < 400;
+        response.setHeader('Content-Type', streaming ? 'text/event-stream; charset=utf-8' : 'application/json; charset=utf-8');
+        if (streaming) response.setHeader('X-Generation-Stream-End', streamEndEvent);
         response.setHeader('X-Accel-Buffering', 'no');
     };
+    // A proxy can close a partial HTTP stream cleanly. Only signal success after the final result is stored.
+    const end = () => response.end(record.stream && record.status === 'completed' ? `\n\nevent: ${streamEndEvent}\ndata: [DONE]\n\n` : undefined);
     if (!sink) {
         if (record.acknowledged || record.status !== 'completed') return response.status(409).json({ error: { message: record.error || `Task is ${record.status}.` } });
         headers();
-        return response.end(store.result(record.id));
+        response.write(store.result(record.id));
+        return end();
     }
     const cleanup = () => {
         sink.off('chunk', onChunk);
@@ -66,7 +72,7 @@ export function attachTaskResponse(store, record, response) {
         if (response.destroyed) return;
         if (result.status === 'cancelled' || (result.status === 'failed' && sink.statusCode < 400)) { response.destroy(); return; }
         headers();
-        response.end();
+        end();
     };
     sink.on('chunk', onChunk);
     sink.once('terminal', onTerminal);
@@ -112,8 +118,15 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         const store = storeFor(req);
         const task = store.require(req.params.id);
         const { messages } = readTaskChat(req, task, sanitize);
-        if (!messages.some(message => hasCompletedTask(message, task.id))) throw taskError('The reply has not been saved to the original chat yet.', 409);
-        store.acknowledge(task.id);
+        const index = messages.findIndex(message => hasCompletedTask(message, task.id));
+        if (index < 0) throw taskError('The reply has not been saved to the original chat yet.', 409);
+        if (!task.acknowledged) store.acknowledge(task.id);
+        if (req.body?.includeMessage && index === messages.length - 1) {
+            const prefixHash = task.context.baseLast ? task.context.prefixHash : task.context.baseHash;
+            if (hash(chatFingerprintInput(messages.slice(0, index))) === prefixHash) {
+                return res.json({ ok: true, index, message: messages[index] });
+            }
+        }
         res.json({ ok: true });
     }));
     router.post('/recovery/:id/discard', route((req, res) => {
@@ -156,7 +169,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         writePrivateFile(saved.filename, [saved.header, ...saved.messages].map(row => JSON.stringify(row)).join('\n'));
         // If acknowledgement fails, the message marker makes a retry idempotent.
         store.acknowledge(task.id);
-        res.json({ ok: true, index: edit.index });
+        res.json({ ok: true, index: edit.index, ...(req.body.includeMessage ? { message } : {}) });
     }));
 
     router.post('/generate', route((req, res, next) => {

@@ -225,17 +225,26 @@ test('disconnect during streaming keeps generation alive and restores exactly on
     upstream.end(sse('世界')); await nextTurn();
     const detail = (await app.call('GET', `/recovery/${job.id}/result`)).response.data();
     assert.equal(detail.reply.text, 'Hello 世界'); assert.equal(detail.reply.signature, 'signature==');
-    assert.equal((await app.call('POST', '/generate', job.body)).response.text(), sse('Hello ', false) + sse('世界'));
+    const replay = (await app.call('POST', '/generate', job.body)).response;
+    assert.equal(first.response.headers['x-generation-stream-end'], 'generation-complete');
+    assert.equal(replay.headers['x-generation-stream-end'], 'generation-complete');
+    assert.equal(replay.text(), sse('Hello ', false) + sse('世界') + '\n\nevent: generation-complete\ndata: [DONE]\n\n');
     assert.equal(invocations, 1);
     const now = Date.now; t.mock.method(Date, 'now', () => now() + 4000);
     const claim = (await app.call('POST', `/recovery/${job.id}/claim`, { client: randomUUID() })).response.data();
-    const body = { token: claim.token, text: detail.reply.text, reasoning: detail.reply.reasoning };
+    const body = { token: claim.token, text: detail.reply.text, reasoning: detail.reply.reasoning, includeMessage: true };
     const applied = await app.call('POST', `/recovery/${job.id}/apply`, body);
     assert.equal(applied.response.statusCode, 200);
     const again = await app.call('POST', `/recovery/${job.id}/apply`, body);
     assert.equal(again.response.statusCode, 200); assert.equal(again.response.data().alreadySaved, true);
     const rows = fs.readFileSync(app.filename, 'utf8').split('\n').map(JSON.parse);
     assert.equal(rows.length, 3); assert.equal(rows[2].mes, 'Hello 世界'); assert.equal(rows[2].extra.reasoning_signature, 'signature==');
+    assert.deepEqual(applied.response.data().message, rows[2]);
+    const confirm = () => app.call('POST', `/recovery/${job.id}/ack`, { includeMessage: true });
+    assert.deepEqual((await confirm()).response.data(), { ok: true, index: 1, message: rows[2] });
+    rows[1].mes = 'Edited earlier in another tab';
+    fs.writeFileSync(app.filename, rows.map(JSON.stringify).join('\n'));
+    assert.deepEqual((await confirm()).response.data(), { ok: true });
     assert.ok(fs.existsSync(path.join(app.user.directories.backups, `recovery-${job.id}.jsonl`)));
     assert.equal((await app.call('GET', '/recovery')).response.data().tasks.length, 0);
 });
@@ -245,6 +254,7 @@ test('normal delivery carries original HTTP/JSON and ACK waits for an actual sav
     const job = app.generate(randomUUID(), false);
     const { response } = await app.call('POST', '/generate', job.body); await nextTurn();
     assert.deepEqual(response.data(), JSON.parse(replyJSON()));
+    assert.equal(response.headers['x-generation-stream-end'], undefined);
     assert.equal((await app.call('POST', `/recovery/${job.id}/ack`)).response.statusCode, 409);
     const rows = fs.readFileSync(app.filename, 'utf8').split('\n').map(JSON.parse);
     const message = assistantMessage(); markTask(message, job.id, true); rows.push(message);
@@ -336,10 +346,24 @@ test('recovery leases exclude another tab and expire safely', async t => {
     assert.notEqual(store.claim(id, second), token);
 });
 
-async function browserFixture() {
+function browserStorage() {
+    const values = new Map();
+    return {
+        get length() { return values.size; },
+        key: index => [...values.keys()][index] ?? null,
+        getItem: key => values.get(key) ?? null,
+        setItem: (key, value) => values.set(key, String(value)),
+        removeItem: key => values.delete(key),
+    };
+}
+
+const json = (data, status = 200) => ({ ok: status < 400, status, json: async () => data });
+
+async function browserFixture({ handle = 'user', storage = browserStorage(), values = new Map(), respond = () => json({ ok: true }) } = {}) {
     const { runInNewContext } = await import('node:vm');
     const callbacks = new Map(); const requests = [];
-    const values = new Map();
+    const timers = new Map(); const windowEvents = new Map(); const documentEvents = new Map();
+    let nextTimer = 0;
     const core = {};
     const ctx = {
         uuidv4: randomUUID, chat: [userMessage()], chatId: 'Chat', characterId: 0,
@@ -353,16 +377,25 @@ async function browserFixture() {
     const sandbox = {
         core, getContext: () => ctx, sha256: hash, RECOVERY_TYPES: ['normal', 'regenerate', 'continue', 'swipe'], RECOVERY_VERSION: 1,
         chatFingerprintInput, markTask, planRecovery, structuredClone, AbortController,
+        localStorage: storage, accountsEnabled: true, currentUser: { handle }, getCurrentUserHandle: () => handle,
         getRegexedString: value => value, regex_placement: {},
-        setTimeout: () => 1, clearTimeout: () => {},
-        document: { hidden: false, querySelector: () => null, addEventListener: () => {} },
-        window: { addEventListener: () => {} }, toastr: { warning: () => {}, error: () => {}, success: () => {} },
+        setTimeout: (callback, delay) => { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
+        clearTimeout: id => timers.delete(id),
+        document: { hidden: false, querySelector: () => null, addEventListener: (name, handler) => documentEvents.set(name, handler) },
+        window: { addEventListener: (name, handler) => windowEvents.set(name, handler) }, toastr: { warning: () => {}, error: () => {}, success: () => {} },
         console, getComputedStyle: () => ({ display: 'none' }),
-        fetch: async (url, options) => { requests.push({ url, options }); return { ok: true, json: async () => ({ ok: true }) }; },
+        fetch: async (url, options) => { requests.push({ url, options }); return respond(url, options); },
     };
     const source = fs.readFileSync(new URL('../public/scripts/extensions/generation-recovery/index.js', import.meta.url), 'utf8').replace(/^import .*;\n/gm, '');
     runInNewContext(source, sandbox);
-    return { callbacks, ctx, requests, core };
+    async function tick() {
+        const [id, timer] = [...timers].sort((a, b) => a[1].delay - b[1].delay)[0];
+        timers.delete(id);
+        timer.callback();
+        await nextTurn();
+        return timer.delay;
+    }
+    return { callbacks, ctx, requests, core, timers, tick, windowEvents, documentEvents, document: sandbox.document };
 }
 
 test('browser hooks opt in only eligible requests and never mark a failed stream as complete', async () => {
@@ -391,4 +424,134 @@ test('the explicit browser stop event sends a separate cancellable task request'
     assert.equal(requests[0].url, `/api/backends/chat-completions/recovery/${data.generation_recovery.id}/cancel`);
     assert.equal(requests[0].options.method, 'POST');
     assert.equal(requests[0].options.keepalive, true);
+});
+
+test('switching chats during preparation aborts an eligible request before dispatch', async () => {
+    const page = await browserFixture();
+    page.ctx.saveChat = async () => { page.ctx.chatId = 'Other chat'; };
+    const preparation = new AbortController();
+    const data = { type: 'normal', chat_completion_source: 'vertexai' };
+    await page.callbacks.get('CHAT_COMPLETION_SETTINGS_READY')(data, preparation);
+    assert.ok(preparation.signal.aborted);
+    assert.equal(data.generation_recovery, undefined);
+});
+
+test('a continuation disconnected before the first token can replace its own placeholder', async () => {
+    const page = await browserFixture();
+    page.ctx.chat.push(assistantMessage());
+    const stream = { messageId: -1, abortController: new AbortController() };
+    page.ctx.streamingProcessor = stream;
+    const data = { type: 'continue', chat_completion_source: 'vertexai', stream: true };
+    await page.callbacks.get('CHAT_COMPLETION_SETTINGS_READY')(data);
+    stream.messageId = 1;
+    page.ctx.chat[1].mes += '...';
+    stream.abortController.abort();
+    const { id, context: baseline } = data.generation_recovery;
+    assert.deepEqual(planRecovery(page.ctx.chat, baseline, id, hash), { kind: 'replace', index: 1 });
+    assert.equal(page.ctx.chat[1].extra.generation_task_complete, false);
+});
+
+test('a fresh tab retries discovery with capped backoff and stops when the list is empty', async () => {
+    let attempts = 0;
+    const page = await browserFixture({ respond: () => {
+        if (++attempts === 1) throw new TypeError('Network down');
+        return attempts < 8 ? json({}, 503) : json({ tasks: [] });
+    } });
+    page.windowEvents.get('pageshow')();
+    const delays = [];
+    for (let i = 0; i < 8; i++) delays.push(await page.tick());
+    assert.deepEqual(delays, [0, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+    assert.equal(page.timers.size, 0);
+    page.document.hidden = true;
+    page.documentEvents.get('visibilitychange')();
+    assert.equal(page.timers.size, 0);
+    page.document.hidden = false;
+    page.documentEvents.get('visibilitychange')();
+    assert.equal(await page.tick(), 0);
+});
+
+test('a reconnect during an in-flight discovery runs one more check', async () => {
+    let finish;
+    const page = await browserFixture({ respond: () => finish ? json({ tasks: [] }) : new Promise(resolve => { finish = resolve; }) });
+    await page.tick();
+    page.windowEvents.get('online')();
+    await page.tick();
+    assert.equal(page.requests.length, 1);
+    finish(json({ tasks: [] }));
+    await nextTurn();
+    assert.equal(await page.tick(), 0);
+    assert.equal(page.requests.length, 2);
+    assert.equal(page.timers.size, 0);
+});
+
+test('an offline stop survives a fresh page and only the originating account retries it', async () => {
+    const storage = browserStorage();
+    const offline = await browserFixture({ storage, respond: () => { throw new TypeError('Offline'); } });
+    const data = { type: 'normal', chat_completion_source: 'vertexai', stream: true };
+    await offline.callbacks.get('CHAT_COMPLETION_SETTINGS_READY')(data);
+    offline.callbacks.get('GENERATION_STOPPED')();
+    await nextTurn();
+    assert.equal(storage.length, 1);
+    const other = await browserFixture({ handle: 'other', storage, respond: () => json({ tasks: [] }) });
+    await other.tick();
+    assert.equal(other.requests.length, 1);
+    assert.equal(storage.length, 1);
+    const online = await browserFixture({ storage, respond: () => json({ tasks: [] }) });
+    await online.tick();
+    assert.deepEqual(online.requests.map(req => req.url.split('/').at(-1)), ['cancel', 'recovery']);
+    assert.ok(online.requests[0].url.includes(data.generation_recovery.id));
+    assert.equal(storage.length, 0);
+});
+
+test('stops queued by older clients are drained after upgrading', async () => {
+    const key = 'generation-recovery-cancel-requests';
+    const id = randomUUID();
+    const values = new Map([[key, JSON.stringify({ [id]: Date.now() })]]);
+    const page = await browserFixture({ values, respond: () => json({ tasks: [] }) });
+    await page.tick();
+    assert.ok(page.requests[0].url.endsWith(`/${id}/cancel`));
+    assert.deepEqual(JSON.parse(values.get(key)), {});
+});
+
+test('a lost apply response displays the saved reply once without downloading the whole chat', async () => {
+    const task = { id: randomUUID(), status: 'completed', context: context(), createdAt: 1, updatedAt: 2 };
+    const reply = parseVertexReply(replyJSON(), false);
+    const message = buildRecoveredMessage(task.context, reply, task);
+    let writes = 0;
+    const page = await browserFixture({ respond: (url, options) => {
+        switch (url.split('/').at(-1)) {
+            case 'recovery': return json({ tasks: writes ? [] : [task] });
+            case 'claim': return json({ token: 'token' });
+            case 'result': return json({ task, reply });
+            case 'apply': writes++; throw new TypeError('Lost response after commit');
+            case 'ack': return writes && JSON.parse(options.body).includeMessage ? json({ ok: true, index: 1, message }) : json({}, 409);
+            default: throw new Error(`Unexpected request: ${url}`);
+        }
+    } });
+    const rendered = [];
+    page.core.redisplayChat = ({ startIndex }) => rendered.push(startIndex);
+    await page.tick();
+    assert.equal(page.ctx.chat.length, 1);
+    await page.tick();
+    assert.equal(writes, 1);
+    assert.deepEqual(rendered, [1]);
+    assert.equal(page.ctx.chat[1].mes, reply.text);
+    assert.ok(hasCompletedTask(page.ctx.chat[1], task.id));
+    assert.equal(page.timers.size, 0);
+});
+
+test('a local edit during the claim is preserved and prevents apply', async () => {
+    const task = { id: randomUUID(), status: 'completed', context: context() };
+    const page = await browserFixture({ respond: url => {
+        switch (url.split('/').at(-1)) {
+            case 'recovery': return json({ tasks: [task] });
+            case 'ack': return json({}, 409);
+            case 'claim': page.ctx.chat[0].mes = 'User edit'; return json({ token: 'token' });
+            case 'result': return json({ task, reply: parseVertexReply(replyJSON(), false) });
+            default: throw new Error(`Unexpected request: ${url}`);
+        }
+    } });
+    await page.tick();
+    assert.equal(page.ctx.chat[0].mes, 'User edit');
+    assert.ok(!page.requests.some(req => req.url.endsWith('/apply')));
 });

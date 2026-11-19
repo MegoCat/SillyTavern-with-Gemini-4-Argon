@@ -1,6 +1,7 @@
 import { sha256 } from '../../../lib.js';
 import * as core from '../../../script.js';
 import { getContext } from '../../st-context.js';
+import { accountsEnabled, currentUser, getCurrentUserHandle } from '../../user.js';
 import { getRegexedString, regex_placement } from '../regex/engine.js';
 import { RECOVERY_TYPES, RECOVERY_VERSION, chatFingerprintInput, markTask, planRecovery } from '../../util/generation-recovery.js';
 
@@ -12,7 +13,10 @@ const warned = new Set();
 let activeId;
 let timer;
 let polling = false;
+let checkAgain = false;
+let retryDelay = 2000;
 let restoring = false;
+let pendingApply;
 let internalStop = false;
 let panel;
 
@@ -43,56 +47,68 @@ async function jsonRequest(url, method = 'GET', body, options = {}) {
             method, cache: 'no-store', headers: getContext().getRequestHeaders(),
             ...(body === undefined ? {} : { body: JSON.stringify(body) }), ...options, signal: controller.signal,
         });
-        const data = await response.json();
-        if (!response.ok) throw Object.assign(new Error(data?.error?.message || `HTTP ${response.status}`), { status: response.status });
-        return data;
+        if (!response.ok) {
+            const data = await response.json().catch(() => null);
+            throw Object.assign(new Error(data?.error?.message || `HTTP ${response.status}`), { status: response.status });
+        }
+        return await response.json();
     } finally { clearTimeout(timeout); }
 }
-function pendingCancels() {
+function legacyCancels() {
     try {
         const value = JSON.parse(getContext().accountStorage.getItem(CANCEL_KEY) || '{}');
         return value && !Array.isArray(value) && typeof value === 'object' ? value : {};
     } catch { return {}; }
 }
-function setCancels(value) {
-    getContext().accountStorage.setItem(CANCEL_KEY, JSON.stringify(value));
+function cancelPrefix() {
+    if (accountsEnabled && !currentUser) throw new Error('The current account handle is unavailable.');
+    return `${CANCEL_KEY}:${encodeURIComponent(getCurrentUserHandle())}:`;
+}
+function pendingCancels() {
+    const queued = legacyCancels();
+    try {
+        const prefix = cancelPrefix();
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key?.startsWith(prefix)) queued[key.slice(prefix.length)] = Number(localStorage.getItem(key));
+        }
+    } catch { /* Account storage is the fallback when browser storage is unavailable. */ }
+    return queued;
+}
+function forgetCancel(id) {
+    try { localStorage.removeItem(cancelPrefix() + id); } catch { /* Browser storage is unavailable. */ }
+    const queued = legacyCancels();
+    if (Object.hasOwn(queued, id)) {
+        delete queued[id];
+        getContext().accountStorage.setItem(CANCEL_KEY, JSON.stringify(queued));
+    }
 }
 function schedule(delay = 2000) {
     clearTimeout(timer);
-    if (!document.hidden) timer = setTimeout(() => void poll(), delay);
+    timer = undefined;
+    if (!document.hidden) timer = setTimeout(() => { timer = undefined; void poll(); }, delay);
 }
-async function cancelTask(id) {
-    const queued = pendingCancels();
-    queued[id] ??= Date.now();
-    setCancels(queued);
+async function deliverCancel(id, requestedAt, keepalive = false) {
     try {
-        await jsonRequest(`${BASE}/${id}/cancel`, 'POST', {}, { keepalive: true });
-        const remaining = pendingCancels();
-        delete remaining[id];
-        setCancels(remaining);
+        await jsonRequest(`${BASE}/${id}/cancel`, 'POST', {}, { keepalive });
+        forgetCancel(id);
         localTasks.delete(id);
     } catch (error) {
-        if (error.status !== 404) notifyOnce(`cancel-${id}`, '停止请求暂未送达；后台可能仍在生成。恢复网络后会再次发送停止请求。');
+        // The original generate POST can arrive after its cancel request.
+        if (error.status === 404 && Date.now() - requestedAt > 10 * 60 * 1000) forgetCancel(id);
+        if (keepalive && error.status !== 404) notifyOnce(`cancel-${id}`, '停止请求暂未送达；后台可能仍在生成。恢复网络后会再次发送停止请求。');
     }
-    schedule();
 }
-async function flushCancels() {
-    for (const [id, requestedAt] of Object.entries(pendingCancels())) {
-        try {
-            await jsonRequest(`${BASE}/${id}/cancel`, 'POST', {});
-            const queued = pendingCancels();
-            delete queued[id];
-            setCancels(queued);
-            localTasks.delete(id);
-        } catch (error) {
-            // A stop can race the initial generate POST. Do not treat its first 404 as success.
-            if (error.status === 404 && Date.now() - requestedAt > 10 * 60 * 1000) {
-                const queued = pendingCancels();
-                delete queued[id];
-                setCancels(queued);
-            }
-        }
+async function cancelTask(id) {
+    const requestedAt = Date.now();
+    try {
+        // AccountStorage saves to the server. A separate local key per task survives an offline reload and concurrent tabs.
+        localStorage.setItem(cancelPrefix() + id, String(requestedAt));
+    } catch {
+        getContext().accountStorage.setItem(CANCEL_KEY, JSON.stringify({ ...legacyCancels(), [id]: requestedAt }));
     }
+    await deliverCancel(id, requestedAt, true);
+    schedule(0);
 }
 
 async function prepareGeneration(data) {
@@ -101,10 +117,10 @@ async function prepareGeneration(data) {
     const chat = currentChat();
     if (!chat || !RECOVERY_TYPES.includes(type) || data.chat_completion_source !== 'vertexai'
         || (data.vertexai_auth_mode || 'express') !== 'express' || data.tools?.length || data.request_images) return;
-    if (restoring) throw new Error('A reply is being restored. Please wait for it to appear before generating.');
+    if (restoring || sameChat(pendingApply?.context.chat, chat)) throw new Error('上一条回复正在恢复，请等它显示后再生成。');
     // The server verifies this durable baseline before calling the model.
     await ctx.saveChat();
-    if (!sameChat(chat, currentChat())) throw new Error('The chat changed before generation started.');
+    if (!sameChat(chat, currentChat())) throw new Error('聊天已切换，本次生成已取消。');
     const messages = getContext().chat;
     if (!messages.length) return;
     const id = ctx.uuidv4();
@@ -119,6 +135,13 @@ async function prepareGeneration(data) {
     data.generation_recovery = { id, context };
     localTasks.set(id, { context, stream: Boolean(data.stream), lastActivity: Date.now() });
     activeId = id;
+    const stream = ctx.streamingProcessor;
+    if (data.stream && stream) {
+        // A continuation or swipe can create its placeholder and disconnect before the first token.
+        stream.abortController.signal.addEventListener('abort', () => {
+            if (activeId === id) markCurrentMessage(stream.messageId);
+        }, { once: true });
+    }
     schedule();
 }
 
@@ -136,21 +159,48 @@ function markCurrentMessage(messageId, final = false) {
     if (final) schedule();
 }
 
+async function showSavedReply(task, saved) {
+    if (sameChat(task.context.chat, currentChat())) {
+        if (busy()) return;
+        // A user may have edited the chat while the apply request was in flight.
+        let edit;
+        try {
+            edit = planRecovery(getContext().chat, task.context, task.id, sha256);
+        } catch {
+            pendingApply = undefined;
+            notifyOnce(`reload-${task.id}`, '最终回复已写入原聊天。当前页面有其他修改，已保留编辑现场。');
+            return;
+        }
+        if (edit.kind !== 'already') {
+            if (saved.message && saved.index === edit.index) {
+                const viewport = document.querySelector('#chat');
+                const atBottom = viewport && viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop < 5;
+                getContext().chat[edit.index] = saved.message;
+                await core.redisplayChat({ startIndex: edit.index, fade: false });
+                if (atBottom) core.scrollChatToBottom({ waitForFrame: true });
+            } else {
+                // A different tab may already have added more messages. Load its complete saved history.
+                await getContext().reloadCurrentChat();
+            }
+        }
+        toastr.success('已将最终回复恢复到原聊天，未重新调用模型。', '断线恢复');
+    }
+    pendingApply = undefined;
+}
+
 async function restoreTask(task, automatic = false) {
-    if (restoring || busy() || !sameChat(task.context.chat, currentChat())) return;
+    if (restoring || pendingApply || busy() || !sameChat(task.context.chat, currentChat())) return;
     if (pendingCancels()[task.id]) return;
     restoring = true;
     const chat = currentChat();
     try {
-        // Verify BOTH local and disk history. Do not overwrite unsaved edits or another tab's new messages.
-        const { task: detail, reply } = await jsonRequest(`${BASE}/${task.id}/result`);
-        const disk = await jsonRequest('/api/chats/get', 'POST', { avatar_url: chat.avatar, file_name: chat.fileName });
-        if (!sameChat(chat, currentChat()) || busy()) return;
-        planRecovery(getContext().chat, detail.context, task.id, sha256);
-        planRecovery(disk.slice(1), detail.context, task.id, sha256);
-        if (reply.hasTools || reply.hasImages) throw new Error('这条结果含工具调用或生成媒体，不能自动恢复；可先查看保存的正文。');
+        planRecovery(getContext().chat, task.context, task.id, sha256);
         const { token } = await jsonRequest(`${BASE}/${task.id}/claim`, 'POST', { client: clientId });
-        if (!sameChat(chat, currentChat()) || busy()) return;
+        const { task: detail, reply } = await jsonRequest(`${BASE}/${task.id}/result`);
+        if (!sameChat(chat, currentChat()) || busy() || pendingCancels()[task.id]) return;
+        // Recheck local edits after the network waits. /apply checks the on-disk history immediately before writing.
+        planRecovery(getContext().chat, detail.context, task.id, sha256);
+        if (reply.hasTools || reply.hasImages) throw new Error('这条结果含工具调用或生成媒体，不能自动恢复；可先查看保存的正文。');
         const isContinue = detail.context.type === 'continue';
         let text = isContinue ? (detail.context.baseLast.mes ?? '') + reply.text : reply.text;
         let reasoning = getRegexedString(reply.reasoning, regex_placement.REASONING);
@@ -161,26 +211,52 @@ async function restoreTask(task, automatic = false) {
             text = getRegexedString(text, regex_placement.AI_OUTPUT);
         }
         if (getContext().powerUserSettings.trim_spaces) { text = text.trim(); reasoning = reasoning.trim(); }
-        await jsonRequest(`${BASE}/${task.id}/apply`, 'POST', { token, text, reasoning });
+        pendingApply = task;
+        const saved = await jsonRequest(`${BASE}/${task.id}/apply`, 'POST', { token, text, reasoning, includeMessage: true });
         localTasks.delete(task.id);
         if (activeId === task.id) activeId = undefined;
-        if (sameChat(chat, currentChat())) await getContext().reloadCurrentChat();
-        toastr.success('已将最终回复恢复到原聊天，未重新调用模型。', '断线恢复');
+        await showSavedReply(task, saved);
+        schedule(0);
     } catch (error) {
         // A short server-side lease/grace period is expected during normal delivery.
-        if (error.status === 410 || (error.status === 409 && /original client|Another tab|lease expired/.test(error.message))) return;
-        if (!automatic || !warned.has(task.id)) notifyOnce(task.id, error.message);
+        if (error.status === 409 && /original client/.test(error.message)) { schedule(3000); return; }
+        if (error.status === 410 || (error.status === 409 && /Another tab|lease expired/.test(error.message))) return;
+        if (!automatic || !isTransient(error)) notifyOnce(task.id, error.message);
     } finally { restoring = false; }
 }
 
-async function poll() {
-    if (polling || document.hidden) return;
-    polling = true;
-    let tasks = [];
+function isTransient(error) {
+    return !error.status ? error.name === 'TypeError' || error.name === 'AbortError' || error.name === 'SyntaxError'
+        : error.status >= 500 || [408, 429].includes(error.status);
+}
+
+async function confirmPendingApply() {
+    const task = pendingApply;
+    if (!task || restoring || busy()) return;
+    if (!sameChat(task.context.chat, currentChat())) {
+        pendingApply = undefined;
+        return;
+    }
+    // /apply can commit even if its response never reaches this tab. Ask for the durably saved message.
     try {
-        await flushCancels();
-        ({ tasks } = await jsonRequest(BASE));
+        const saved = await jsonRequest(`${BASE}/${task.id}/ack`, 'POST', { includeMessage: true });
+        await showSavedReply(task, saved);
+    } catch (error) {
+        if (error.status !== 404 && error.status !== 409) throw error;
+        pendingApply = undefined;
+    }
+}
+
+async function poll() {
+    if (document.hidden) return;
+    if (polling) { checkAgain = true; return; }
+    polling = true;
+    let nextDelay;
+    try {
+        for (const [id, requestedAt] of Object.entries(pendingCancels())) await deliverCancel(id, requestedAt);
+        const { tasks } = await jsonRequest(BASE);
         renderTasks(tasks);
+        await confirmPendingApply();
         const knownIds = new Set(tasks.map(task => task.id));
         if (!busy()) {
             for (const [id, local] of localTasks) {
@@ -188,18 +264,25 @@ async function poll() {
             }
         }
         for (const task of tasks) {
+            if (task.status !== 'running' && task.status !== 'completed') {
+                localTasks.delete(task.id);
+                continue;
+            }
             if (task.status !== 'completed' || pendingCancels()[task.id]) continue;
             // ACK is accepted only if the server finds the completed task marker in the originating JSONL.
             try {
                 await jsonRequest(`${BASE}/${task.id}/ack`, 'POST', {});
                 localTasks.delete(task.id);
                 if (activeId === task.id) activeId = undefined;
+                schedule(0);
                 continue;
             } catch (error) { if (error.status !== 409 && error.status !== 404) throw error; }
             const local = localTasks.get(task.id);
             if (busy() && activeId === task.id && Date.now() - task.updatedAt > 15000
                 && Date.now() - (local?.lastActivity ?? 0) > 15000 && sameChat(task.context.chat, currentChat())) {
                 // Only abort the stale browser reader, not the already-completed server task.
+                const stream = getContext().streamingProcessor;
+                if (local?.stream && stream) markCurrentMessage(stream.messageId);
                 activeId = undefined;
                 internalStop = true;
                 try { getContext().stopGeneration(); } finally { internalStop = false; }
@@ -208,11 +291,22 @@ async function poll() {
             }
             await restoreTask(task, true);
         }
+        const awaitingRegistration = [...localTasks.keys()].some(id => !knownIds.has(id));
+        if (pendingApply || awaitingRegistration || Object.keys(pendingCancels()).length || tasks.some(task => task.status === 'running')) nextDelay = 5000;
+        else if (tasks.some(task => task.status === 'completed' && sameChat(task.context.chat, currentChat()))) nextDelay = 15000;
+        retryDelay = 2000;
     } catch (error) {
         console.debug('Generation recovery is waiting for the server:', error.message);
+        if (isTransient(error)) {
+            nextDelay = retryDelay;
+            retryDelay = Math.min(30000, retryDelay * 2);
+        }
     } finally {
         polling = false;
-        if (tasks.length || localTasks.size || Object.keys(pendingCancels()).length) schedule(tasks.some(t => t.status === 'running') ? 5000 : 15000);
+        if (checkAgain) {
+            checkAgain = false;
+            schedule(0);
+        } else if (timer === undefined && nextDelay !== undefined) schedule(nextDelay);
     }
 }
 
@@ -278,7 +372,15 @@ const { eventSource, eventTypes } = getContext();
 eventSource.on(eventTypes.GENERATION_STARTED, (type, options, dryRun) => {
     if (!dryRun && type !== 'quiet') activeId = undefined;
 });
-eventSource.on(eventTypes.CHAT_COMPLETION_SETTINGS_READY, prepareGeneration);
+eventSource.on(eventTypes.CHAT_COMPLETION_SETTINGS_READY, async (data, preparation) => {
+    try {
+        await prepareGeneration(data);
+    } catch (error) {
+        // EventEmitter logs listener exceptions and continues. Explicitly cancel before the model request is sent.
+        preparation?.abort(error);
+        toastr.error(error.message, '断线恢复');
+    }
+});
 eventSource.on(eventTypes.STREAM_TOKEN_RECEIVED, () => markCurrentMessage());
 eventSource.on(eventTypes.MESSAGE_RECEIVED, id => markCurrentMessage(Number(id), true));
 eventSource.on(eventTypes.MESSAGE_EDITED, id => {
@@ -289,10 +391,11 @@ eventSource.on(eventTypes.GENERATION_STOPPED, () => {
     if (!internalStop && activeId && localTasks.has(activeId)) void cancelTask(activeId);
 });
 eventSource.on(eventTypes.GENERATION_ENDED, () => schedule());
-eventSource.on(eventTypes.CHAT_CHANGED, () => schedule());
+eventSource.on(eventTypes.CHAT_CHANGED, () => schedule(0));
 eventSource.on(eventTypes.APP_READY, () => { mountPanel(); schedule(); });
-window.addEventListener('online', () => schedule());
-window.addEventListener('focus', () => schedule());
-document.addEventListener('visibilitychange', () => schedule());
+window.addEventListener('online', () => schedule(0));
+window.addEventListener('pageshow', () => schedule(0));
+window.addEventListener('focus', () => schedule(0));
+document.addEventListener('visibilitychange', () => schedule(0));
 mountPanel();
 schedule();

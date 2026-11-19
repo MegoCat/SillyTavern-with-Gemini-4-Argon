@@ -3145,7 +3145,9 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
 
     const model = getChatCompletionModel(oai_settings);
     const { generate_data, stream, canMultiSwipe } = await createGenerationParameters(oai_settings, model, type, messages, { jsonSchema });
-    await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
+    const preparation = new AbortController();
+    await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data, preparation);
+    preparation.signal.throwIfAborted();
 
     const generate_url = '/api/backends/chat-completions/generate';
     const response = await fetch(generate_url, {
@@ -3160,6 +3162,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
         throw new Error(`Got response status ${response.status}`);
     }
     if (stream) {
+        const endEvent = response.headers.get('X-Generation-Stream-End');
         const eventStream = getEventSourceStream();
         response.body.pipeThrough(eventStream);
         const reader = eventStream.readable.getReader();
@@ -3170,9 +3173,15 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
             const state = { reasoning: '', images: [], signature: '', toolSignatures: {} };
             while (true) {
                 const { done, value } = await reader.read();
-                if (done) return;
+                if (done) {
+                    if (endEvent) throw new Error('The connection closed before the final reply arrived. Generation recovery will check the server.');
+                    return;
+                }
                 const rawData = value.data;
-                if (rawData === '[DONE]') return;
+                if (rawData === '[DONE]') {
+                    if (!endEvent || value.type === endEvent) return;
+                    continue;
+                }
                 tryParseStreamingError(response, rawData);
                 const parsed = JSON.parse(rawData);
 
