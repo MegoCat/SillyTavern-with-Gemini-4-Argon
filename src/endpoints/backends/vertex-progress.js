@@ -1,7 +1,9 @@
 import process from 'node:process';
 import { finished } from 'node:stream';
+import { inspect } from 'node:util';
 import { LOG_LEVELS } from '../../constants.js';
 import { color, getConfigValue } from '../../util.js';
+import { VertexResponseMetadata } from './vertex-response-metadata.js';
 
 const live = new Set();
 let nextId = 0;
@@ -54,8 +56,9 @@ export class VertexProgress {
         this.started = performance.now();
         this.stream = stream;
         this.limits = 0;
-        this.interactive = process.stdout.isTTY && process.env.TERM !== 'dumb'
-            && getConfigValue('logging.minLogLevel', LOG_LEVELS.DEBUG, 'number') <= LOG_LEVELS.INFO;
+        const showInfo = getConfigValue('logging.minLogLevel', LOG_LEVELS.DEBUG, 'number') <= LOG_LEVELS.INFO;
+        this.interactive = showInfo && process.stdout.isTTY && process.env.TERM !== 'dumb';
+        this.metadata = showInfo ? new VertexResponseMetadata() : undefined;
         this.tag = `[Vertex #${this.id}]`;
         const safeModel = String(model).replace(/[^a-zA-Z0-9._/-]/g, '').slice(0, 80);
         print(`${this.tag} ${safeModel} | ${stream ? 'stream' : 'JSON'}`);
@@ -113,6 +116,7 @@ export class VertexProgress {
             this.bodyAt = performance.now();
             if (this.interactive) draw();
         });
+        this.metadata?.observeStream(source);
         const cleanup = finished(source, { readable: true, writable: false }, error => {
             cleanup();
             if (error && !signal.aborted) {
@@ -159,6 +163,7 @@ export class VertexProgress {
         }
         const title = `${this.tag} ${outcome} | total ${duration(end - this.started)}`;
         const paint = { done: color.green, failed: color.red, cancelled: color.yellow }[outcome] ?? color.yellow;
+        let summary;
         if (this.interactive) {
             const lines = [''];
             for (const part of parts) {
@@ -167,10 +172,20 @@ export class VertexProgress {
                 if (lines[last] && joined.length + 2 >= (process.stdout.columns || 80)) lines.push(part);
                 else lines[last] = joined;
             }
-            print(paint(title) + '\n  ' + lines.join('\n  '));
+            summary = paint(title) + '\n  ' + lines.join('\n  ');
         } else {
-            print([title, ...parts].join(' | '));
+            summary = [title, ...parts].join(' | ');
         }
+        const metadata = this.metadata?.snapshot();
+        this.metadata = undefined;
+        if (metadata && Object.keys(metadata).length) {
+            const detail = this.interactive ? inspect(metadata, {
+                colors: color.level > 0, depth: null, maxArrayLength: null, maxStringLength: null,
+                breakLength: process.stdout.columns || 80, compact: 3,
+            }) : JSON.stringify(metadata);
+            summary += `\n  API metadata ${detail}`;
+        }
+        print(summary);
         draw();
     }
 }

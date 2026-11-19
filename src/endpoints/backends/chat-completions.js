@@ -745,10 +745,12 @@ async function sendMakerSuiteRequest(request, response) {
             /** @type {any} */
             const generateResponseJson = await generateResponse.json();
 
+            const capturedMetadata = progress?.metadata?.add(generateResponseJson);
+            const warningDetails = capturedMetadata ? [] : [generateResponseJson];
             const candidates = generateResponseJson?.candidates;
             if (!candidates || candidates.length === 0) {
                 let message = `${apiName} API returned no candidate`;
-                console.warn(message, generateResponseJson);
+                console.warn(message, ...warningDetails);
                 if (generateResponseJson?.promptFeedback?.blockReason) {
                     message += `\nPrompt was blocked due to : ${generateResponseJson.promptFeedback.blockReason}`;
                 }
@@ -764,7 +766,7 @@ async function sendMakerSuiteRequest(request, response) {
             const responseText = typeof responseContent === 'string' ? responseContent : responseContent?.parts?.filter(part => !part.thought)?.map(part => part.text)?.join('\n\n');
             if (!responseText && !functionCall && !inlineData) {
                 let message = `${apiName} Candidate text empty`;
-                console.warn(message, generateResponseJson);
+                console.warn(message, ...warningDetails);
                 progress?.finish('failed');
                 return response.send({ error: { message } });
             }

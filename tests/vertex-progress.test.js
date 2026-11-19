@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { setConfigFilePath } from '../src/util.js';
 import { VertexProgress } from '../src/endpoints/backends/vertex-progress.js';
+import { VertexResponseMetadata } from '../src/endpoints/backends/vertex-response-metadata.js';
 
 setConfigFilePath(fileURLToPath(new URL('../default/config.yaml', import.meta.url)));
 afterEach(() => {
@@ -49,7 +50,7 @@ test('a narrow terminal shows the live countdown and accounts for each phase exa
     progress.observeStream(source, response, new AbortController().signal);
     jest.advanceTimersByTime(2000);
     expect(frames.at(-1)).toContain('first byte 0:02');
-    source.write('one chunk');
+    source.write('data: {"modelSpecific":{"tier":"custom"}}\n\n');
     jest.advanceTimersByTime(3000);
     expect(frames.at(-1)).toContain('receive 0:03');
     source.end();
@@ -57,9 +58,31 @@ test('a narrow terminal shows the live countdown and accounts for each phase exa
     response.emit('close');
     const summary = logs.mock.calls.at(-1)[0];
     expect(summary).toContain('done | total 16.0s');
+    expect(summary).toContain('API metadata');
+    expect(summary).toContain('modelSpecific');
+    expect(summary).toContain('custom');
     for (const phase of ['prep 1.0s', '429 x1 6.0s', 'wait 4.0s', 'first byte 2.0s', 'receive 3.0s']) expect(summary).toContain(phase);
     expect(logs).toHaveBeenCalledTimes(3);
     const writes = frames.length;
     jest.advanceTimersByTime(10000);
     expect(frames).toHaveLength(writes);
+});
+
+test('keeps sparse metadata per candidate without assuming what any model returns', () => {
+    const meta = new VertexResponseMetadata();
+    meta.add({ custom: { text: 'provider annotation', snapshots: ['old'] }, candidates: [
+        { index: 2, output: { parts: [{ text: 'chat', vendorTag: 'a', thoughtSignature: 'sig-a' }] } },
+        { index: 0, content: 'other chat text' },
+    ] });
+    meta.add({ candidates: [{ index: 2, output: { parts: [
+        { thoughtSignature: 'sig-a', vendorTag: 'a' }, { thoughtSignature: 'sig-b' },
+    ] } }] });
+    meta.add({ custom: { snapshots: [], newFlag: false }, candidates: [{ index: 0, newReason: null }] });
+    expect(meta.snapshot()).toEqual({
+        custom: { text: 'provider annotation', snapshots: [], newFlag: false },
+        candidates: [
+            { index: 2, output: { parts: [{ vendorTag: 'a', thoughtSignature: 'sig-a' }, { thoughtSignature: 'sig-b' }] } },
+            { index: 0, newReason: null },
+        ],
+    });
 });

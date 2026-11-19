@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, jest, test } from '@jest/globals';
 import { getEventListeners, once } from 'node:events';
 import http from 'node:http';
+import process from 'node:process';
 import { Readable } from 'node:stream';
 import { generateKeyPairSync } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -87,6 +88,66 @@ describe.each([
             text: async () => text,
         };
     }
+
+    test.each([false, true])('reports provider-defined metadata once and preserves the web response, stream=%s', async (stream) => {
+        jest.replaceProperty(process, 'env', { ...process.env, TERM: 'dumb' });
+        const logs = jest.spyOn(console, 'info').mockImplementation(() => {});
+        const signature = 'Ag+/long-signature=='.repeat(620);
+        const content = { role: 'model', parts: [
+            { text: 'Example reply', thoughtSignature: signature, futurePartField: false },
+            { inlineData: { mimeType: 'image/png', data: 'inline-image-bytes', extra: 0 } },
+        ] };
+        const first = {
+            modelVersion: model, createTime: '2026-11-19T10:01:02Z', responseId: 'id-测试',
+            usageMetadata: { promptTokenCount: 22405, totalTokenCount: 22405, promptTokensDetails: [{ modality: 'TEXT', tokenCount: 22405 }] },
+            futureField: { first: null, sample: [0, false] },
+            candidates: [{ index: 0, content }],
+        };
+        const last = {
+            usageMetadata: { candidatesTokenCount: 12030, totalTokenCount: 34435, trafficType: 'ON_DEMAND' },
+            futureField: { last: true },
+            candidates: [{ index: 0, finishReason: 'STOP', futureCandidateField: { text: 'metadata text' } }],
+        };
+        const full = {
+            ...first, usageMetadata: { ...first.usageMetadata, ...last.usageMetadata },
+            futureField: { ...first.futureField, ...last.futureField }, candidates: [{ ...last.candidates[0], content }],
+        };
+        const sse = '\uFEFF' + JSON.stringify(first, null, 2).split('\n').map(line => 'data: ' + line).join('\r\n')
+            + '\r\n\r\n: ping\r\n\r\ndata: invalid event\r\n\r\ndata: ' + JSON.stringify(last) + '\r\n\r\ndata: [DONE]\r\n\r\n';
+        const bytes = Buffer.from(sse);
+        const split = bytes.indexOf('测') + 1;
+        fetchMock.mockResolvedValueOnce({
+            ok: true, status: 200, statusText: 'OK', json: async () => full,
+            body: Readable.from([bytes.subarray(0, split), bytes.subarray(split, -1), bytes.subarray(-1)]),
+        });
+
+        const response = await generate({ stream });
+        const body = stream ? Buffer.from(await response.arrayBuffer()) : await response.json();
+        const expected = stream ? bytes : { choices: [{ message: { content: 'Example reply\n\n' } }], responseContent: content };
+        expect(body).toEqual(expected);
+        const reports = logs.mock.calls.map(([line]) => line).filter(line => line.includes('API metadata '));
+        expect(reports).toHaveLength(1);
+        expect(reports[0]).toContain('done | total');
+        const metadata = JSON.parse(reports[0].split('API metadata ')[1]);
+        expect(metadata).toEqual({
+            ...full, candidates: [{ ...last.candidates[0], content: { role: 'model', parts: [
+                { thoughtSignature: signature, futurePartField: false }, { inlineData: { mimeType: 'image/png', extra: 0 } },
+            ] } }],
+        });
+    });
+
+    test('reports a blocked reply with only the metadata supplied by the model', async () => {
+        jest.replaceProperty(process, 'env', { ...process.env, TERM: 'dumb' });
+        const logs = jest.spyOn(console, 'info').mockImplementation(() => {});
+        const warnings = jest.spyOn(console, 'warn').mockImplementation(() => {});
+        const packet = { candidates: [], promptFeedback: { blockReason: 'SAFETY', customDetail: { value: 0 } } };
+        fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => packet });
+        expect((await (await generate()).json()).error.message).toContain('SAFETY');
+        const summary = logs.mock.calls.at(-1)[0];
+        expect(summary).toContain('failed | total');
+        expect(JSON.parse(summary.split('API metadata ')[1])).toEqual(packet);
+        expect(warnings).toHaveBeenCalledWith('Google Vertex AI API returned no candidate');
+    });
 
     test.each([false, true])('retries repeated 429s with fresh 5-10 second delays and stream=%s', async (stream) => {
         const warnings = jest.spyOn(console, 'warn').mockImplementation(() => {});
