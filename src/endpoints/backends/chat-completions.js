@@ -71,6 +71,7 @@ import { getGoogleApiConfig } from '../google.js';
 import { getGemini4Model } from '../../../public/scripts/util/gemini.js';
 import { getCookieSecret } from '../../users.js';
 import { fetchGoogleModels, GoogleModelsHttpError } from './google-models.js';
+import { VertexProgress } from './vertex-progress.js';
 
 const API_OPENAI = 'https://api.openai.com/v1';
 const API_CLAUDE = 'https://api.anthropic.com/v1';
@@ -455,6 +456,7 @@ async function sendClaudeRequest(request, response) {
 async function sendMakerSuiteRequest(request, response) {
     const useVertexAi = request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.VERTEXAI;
     const retryOnRateLimit = useVertexAi && (request.body.vertexai_auth_mode || 'express') === 'express';
+    const progress = retryOnRateLimit ? new VertexProgress(response, request.body.model, Boolean(request.body.stream)) : undefined;
     const apiName = useVertexAi ? 'Google Vertex AI' : 'Google AI Studio';
     let apiUrl;
     let apiKey;
@@ -668,7 +670,7 @@ async function sendMakerSuiteRequest(request, response) {
     }
 
     const body = getGeminiBody();
-    console.debug(`${apiName} request:`, body);
+    if (!progress) console.debug(`${apiName} request:`, body);
 
     const controller = new AbortController();
     let upstreamController;
@@ -676,6 +678,7 @@ async function sendMakerSuiteRequest(request, response) {
     request.socket.on('close', () => {
         controller.abort();
         upstreamController?.abort();
+        progress?.finish('cancelled');
     });
     if (response.destroyed) controller.abort();
 
@@ -708,6 +711,7 @@ async function sendMakerSuiteRequest(request, response) {
         while (true) {
             controller.signal.throwIfAborted();
             upstreamController = new AbortController();
+            progress?.attempt();
             generateResponse = await fetch(url, { ...fetchOptions, signal: upstreamController.signal });
             if (!retryOnRateLimit || generateResponse.status !== 429) break;
 
@@ -715,14 +719,15 @@ async function sendMakerSuiteRequest(request, response) {
             upstreamController.abort();
             generateResponse.body?.destroy();
             const retryDelay = 5000 + Math.floor(Math.random() * 5001);
-            console.warn(`${apiName} Express rate limited (429). Retrying in ${retryDelay} ms; stop generation to cancel.`);
+            progress.rateLimited(retryDelay);
             await delay(retryDelay, undefined, { signal: controller.signal });
         }
 
+        progress?.headers(generateResponse);
         if (stream) {
             try {
                 // Pipe remote SSE stream to Express response
-                await forwardFetchResponse(generateResponse, response);
+                await forwardFetchResponse(generateResponse, response, progress && (source => progress.observeStream(source, response, controller.signal)));
             } catch (error) {
                 console.error('Error forwarding streaming response:', error);
                 if (!response.headersSent) {
@@ -747,18 +752,20 @@ async function sendMakerSuiteRequest(request, response) {
                 if (generateResponseJson?.promptFeedback?.blockReason) {
                     message += `\nPrompt was blocked due to : ${generateResponseJson.promptFeedback.blockReason}`;
                 }
+                progress?.finish('failed');
                 return response.send({ error: { message } });
             }
 
             const responseContent = candidates[0].content ?? candidates[0].output;
             const functionCall = (candidates?.[0]?.content?.parts ?? []).some(part => part.functionCall);
             const inlineData = (candidates?.[0]?.content?.parts ?? []).some(part => part.inlineData);
-            console.debug(`${apiName} response:`, util.inspect(generateResponseJson, { depth: 5, colors: true }));
+            if (!progress) console.debug(`${apiName} response:`, util.inspect(generateResponseJson, { depth: 5, colors: true }));
 
             const responseText = typeof responseContent === 'string' ? responseContent : responseContent?.parts?.filter(part => !part.thought)?.map(part => part.text)?.join('\n\n');
             if (!responseText && !functionCall && !inlineData) {
                 let message = `${apiName} Candidate text empty`;
                 console.warn(message, generateResponseJson);
+                progress?.finish('failed');
                 return response.send({ error: { message } });
             }
 

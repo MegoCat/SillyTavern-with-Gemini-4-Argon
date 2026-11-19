@@ -727,9 +727,10 @@ export function getImages(directoryPath, sortBy = 'name', type = MEDIA_REQUEST_T
  * Pipe a fetch() response to an Express.js Response, including status code.
  * @param {import('node-fetch').Response} from The Fetch API response to pipe from.
  * @param {import('express').Response} to The Express response to pipe to.
+ * @param {(source: import('node:stream').Readable) => void} [observeStream] Installs the caller's stream progress and completion reporting.
  * @returns {Promise<void>}
  */
-export async function forwardFetchResponse(from, to) {
+export async function forwardFetchResponse(from, to, observeStream) {
     let statusCode = from.status;
     let statusText = from.statusText;
 
@@ -761,6 +762,7 @@ export async function forwardFetchResponse(from, to) {
     }
 
     if (from.body && to.socket) {
+        observeStream?.(from.body);
         from.body.pipe(to);
 
         to.socket.on('close', function () {
@@ -770,7 +772,7 @@ export async function forwardFetchResponse(from, to) {
         });
 
         from.body.on('end', function () {
-            console.info('Streaming request finished');
+            if (!observeStream) console.info('Streaming request finished');
             to.end();
         });
     } else {

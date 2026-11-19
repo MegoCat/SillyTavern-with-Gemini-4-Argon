@@ -89,6 +89,8 @@ describe.each([
     }
 
     test.each([false, true])('retries repeated 429s with fresh 5-10 second delays and stream=%s', async (stream) => {
+        const warnings = jest.spyOn(console, 'warn').mockImplementation(() => {});
+        const logs = jest.spyOn(console, 'info').mockImplementation(() => {});
         jest.spyOn(Math, 'random')
             .mockReturnValueOnce(0).mockReturnValueOnce(0.5).mockReturnValueOnce(0.999999)
             .mockReturnValue(0.25);
@@ -99,6 +101,10 @@ describe.each([
         expect(response.status).toBe(200);
         expect(await response.text()).toContain('Hello');
         expect(fetchMock).toHaveBeenCalledTimes(13);
+        expect(warnings.mock.calls.filter(([line]) => String(line).includes('429')).length).toBeLessThanOrEqual(1);
+        const summaries = logs.mock.calls.filter(([line]) => String(line).includes('done | total'));
+        expect(summaries).toHaveLength(1);
+        expect(summaries[0][0]).toContain('429 x12');
         expect(retryDelayMock.mock.calls.map(([ms]) => ms)).toEqual([5000, 7500, 10000, ...Array(9).fill(6250)]);
         for (const error of errors) expect(error.body.destroyed).toBe(true);
         for (const call of fetchMock.mock.calls) {
@@ -145,10 +151,12 @@ describe.each([
     });
 
     test.each([false, true])('stops retrying when a different error follows a 429 with stream=%s', async (stream) => {
+        const logs = jest.spyOn(console, 'info').mockImplementation(() => {});
         fetchMock.mockResolvedValueOnce(errorResponse()).mockResolvedValueOnce(errorResponse(503));
         const response = await generate({ stream });
         expect(response.ok).toBe(false);
         expect((await response.json()).error.code).toBe(503);
+        expect(logs.mock.calls.filter(([line]) => String(line).includes('failed | total'))).toHaveLength(1);
         expect(fetchMock).toHaveBeenCalledTimes(2);
         expect(retryDelayMock).toHaveBeenCalledTimes(1);
     });
@@ -176,6 +184,7 @@ describe.each([
     });
 
     test.each([false, true])('cancels the retry wait immediately with stream=%s', async (stream) => {
+        const logs = jest.spyOn(console, 'info').mockImplementation(() => {});
         let notifyWaiting;
         const waiting = new Promise(resolve => { notifyWaiting = resolve; });
         retryDelayMock.mockImplementationOnce((ms, value, options) => {
@@ -193,6 +202,7 @@ describe.each([
         expect(error).toMatchObject({ name: 'AbortError' });
         await expect(retryDelayMock.mock.results[0].value).rejects.toMatchObject({ name: 'AbortError' });
         expect(upstreamSignal.aborted).toBe(true);
+        expect(logs.mock.calls.filter(([line]) => String(line).includes('cancelled | total'))).toHaveLength(1);
         expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(retryDelayMock).toHaveBeenCalledTimes(1);
     });
