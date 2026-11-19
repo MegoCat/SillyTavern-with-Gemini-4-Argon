@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { getConfigValue, tryParse } from './util.js';
+import { getGemini4Model } from '../public/scripts/util/gemini.js';
 
 const PROMPT_PLACEHOLDER = getConfigValue('promptPlaceholder', 'Let\'s get started.');
 
@@ -452,9 +453,13 @@ export function convertGooglePrompt(messages, model, useSysPrompt, names) {
 
     const system_instruction = { parts: sysPrompt.map(text => ({ text })) };
     const toolNameMap = {};
+    const gemini4Model = getGemini4Model(model);
+    const isNeon = gemini4Model === 'gemini-4-neon';
+    const isGemini3Or4 = /gemini-[34]/.test(model);
+    const skipSignatureMagic = 'skip_thought_signature_validator';
 
     // https://ai.google.dev/gemini-api/docs/latest-model#prefilled-model-turn-validation
-    const noPrefillModel = /gemini-3\.[678]-flash|gemini-3\.5-flash-lite|gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+    const noPrefillModel = Boolean(gemini4Model) || /gemini-3\.[678]-flash|gemini-3\.5-flash-lite/.test(model);
 
     const contents = [];
     messages.forEach((message, index) => {
@@ -509,7 +514,7 @@ export function convertGooglePrompt(messages, model, useSysPrompt, names) {
             delete message.name;
         }
 
-        //create the prompt parts
+        // Create the prompt parts
         const parts = [];
         message.content.forEach((part) => {
             const addDataUrlPart = (/** @type {string} */ url, /** @type {string} */ defaultMimeType, /** @type {string?} */ detail = null) => {
@@ -526,7 +531,7 @@ export function convertGooglePrompt(messages, model, useSysPrompt, names) {
                     };
 
                     // https://ai.google.dev/gemini-api/docs/gemini-3#media_resolution
-                    if (/gemini-[34]/.test(model) && mediaResolution) {
+                    if (isGemini3Or4 && mediaResolution) {
                         part.mediaResolution = {
                             level: mediaResolution,
                         };
@@ -573,42 +578,38 @@ export function convertGooglePrompt(messages, model, useSysPrompt, names) {
         });
 
         // https://ai.google.dev/gemini-api/docs/gemini-3#migrating_from_other_models
-        // Inject stored thought signatures, or fall back to bypass magic for Gemini 3 and 4
-        if (/gemini-[34]/.test(model) || /gemini-2\.5/.test(model)) {
-            const skipSignatureMagic = 'skip_thought_signature_validator';
-            const textSignature = message.signature;
-
-            parts.forEach((part) => {
-                if (enableThoughtSignatures && textSignature && typeof part.text === 'string') {
-                    part.thoughtSignature = textSignature;
-                } else if (/gemini-[34]/.test(model)) {
-                    // Gemini 3 and 4: Fall back to bypass magic for function calls (mandatory) and images
-                    if (part.functionCall && !part.thoughtSignature) {
-                        part.thoughtSignature = skipSignatureMagic;
-                    }
-                    if (/-image/.test(model) && message.role === 'model') {
-                        if (typeof part.text === 'string' || part.inlineData) {
-                            part.thoughtSignature = skipSignatureMagic;
-                        }
-                    }
+        // Neon returns its text signature on the final text part of a model turn.
+        if (isGemini3Or4 || /gemini-2\.5/.test(model)) {
+            const finalText = isNeon && message.role === 'model' ? parts.findLast(part => typeof part.text === 'string') : null;
+            const needsImageSignature = isGemini3Or4 && /-image/.test(model) && message.role === 'model';
+            for (const part of parts) {
+                const signText = isNeon ? part === finalText : typeof part.text === 'string';
+                if (enableThoughtSignatures && message.signature && signText) {
+                    part.thoughtSignature = message.signature;
+                } else if (needsImageSignature && (typeof part.text === 'string' || part.inlineData)) {
+                    part.thoughtSignature = skipSignatureMagic;
                 }
-                // Gemini 2.5 without stored signatures: signatures are optional, no bypass needed
-            });
+            }
         }
 
         // merge consecutive messages with the same role
-        if (index > 0 && message.role === contents[contents.length - 1].role) {
+        const previousTurn = contents.at(-1);
+        const continuesTurn = index > 0 && previousTurn.role === message.role;
+        if (continuesTurn && isNeon && message.role === 'model') {
+            // Keep signed model parts intact when combining adjacent history messages.
+            previousTurn.parts.push(...parts);
+        } else if (continuesTurn) {
             parts.forEach((part) => {
                 if (part.text) {
-                    const textPart = contents[contents.length - 1].parts.find(p => typeof p.text === 'string');
+                    const textPart = previousTurn.parts.find(p => typeof p.text === 'string');
                     if (textPart) {
                         textPart.text += '\n\n' + part.text;
                     } else {
-                        contents[contents.length - 1].parts.push(part);
+                        previousTurn.parts.push(part);
                     }
                 }
                 if (part.inlineData || part.functionCall || part.functionResponse || part.thoughtSignature || part.mediaResolution) {
-                    contents[contents.length - 1].parts.push(part);
+                    previousTurn.parts.push(part);
                 }
             });
         } else {
@@ -618,6 +619,20 @@ export function convertGooglePrompt(messages, model, useSysPrompt, names) {
             });
         }
     });
+
+    // Parallel calls can arrive in adjacent messages. Apply signatures to the completed turn.
+    if (isGemini3Or4) {
+        for (const { parts } of contents) {
+            const calls = parts.filter(part => part.functionCall);
+            for (const [index, call] of calls.entries()) {
+                if (isNeon && index > 0) {
+                    delete call.thoughtSignature;
+                } else {
+                    call.thoughtSignature ||= skipSignatureMagic;
+                }
+            }
+        }
+    }
 
     return { contents: contents, system_instruction: system_instruction };
 }
@@ -1180,6 +1195,8 @@ export function calculateClaudeBudgetTokens(maxTokens, reasoningEffort, stream, 
  * @returns {number|string|null} Budget tokens
  */
 export function calculateGoogleBudgetTokens(maxTokens, reasoningEffort, model) {
+    const gemini4Model = getGemini4Model(model);
+
     function getFlashBudget() {
         let budgetTokens = 0;
 
@@ -1264,7 +1281,11 @@ export function calculateGoogleBudgetTokens(maxTokens, reasoningEffort, model) {
 
     function getThinkingLevel() {
         // https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
-        const noMinimalThinking = /gemini-3\.[78]-flash|gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+        const noMinimalThinking = Boolean(gemini4Model) || /gemini-3\.[78]-flash/.test(model);
+        // https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-4-neon
+        if (gemini4Model === 'gemini-4-neon' && [REASONING_EFFORT.max, 'xhigh'].includes(reasoningEffort)) {
+            return 'xhigh';
+        }
         switch (reasoningEffort) {
             case REASONING_EFFORT.auto:
                 return null;
@@ -1306,7 +1327,7 @@ export function calculateGoogleBudgetTokens(maxTokens, reasoningEffort, model) {
         return getGemini3ProBudget();
     }
 
-    if (/gemini-3[.\d]*-flash|gemini-4-(?:argon|carbon)(?:-|$)/.test(model)) {
+    if (gemini4Model || /gemini-3[.\d]*-flash/.test(model)) {
         return getThinkingLevel();
     }
 

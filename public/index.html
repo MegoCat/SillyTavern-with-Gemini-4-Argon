@@ -2182,6 +2182,10 @@
                                                 Selects an effort level on adaptive-thinking models. On older Claude models, it allocates a portion of the response length to thinking. Auto does not request thinking.
                                             </div>
                                             <div class="toggle-description justifyLeft marginBot5" data-source="makersuite,vertexai">
+                                                <span data-i18n="On Gemini 4 Neon, Minimum and Low use LOW, Maximum uses XHIGH, and Auto uses the model default (HIGH).">
+                                                    On Gemini 4 Neon, Minimum and Low use LOW, Maximum uses XHIGH, and Auto uses the model default (HIGH).
+                                                </span>
+                                                <br>
                                                 <span data-i18n="Sets a dynamic reasoning depth level for thinking (Flash 3/Pro 3). High and low are supported by both, minimal and medium are Flash 3 only. Auto lets the model decide.">
                                                     Sets a dynamic reasoning depth level for thinking (Flash 3/Pro 3). High and low are supported by both, minimal and medium are Flash 3 only. Auto lets the model decide.
                                                 </span>
@@ -3414,8 +3418,8 @@
                                             Enter your Google Cloud Project ID or project number to apply the selected region explicitly. Without it, Express mode uses an implicit project and location.
                                         </small>
                                         <br>
-                                        <small data-i18n="For Gemini 4 Argon and Carbon, Project ID is required. Use global (recommended), us, or eu for Region.">
-                                            For Gemini 4 Argon and Carbon, Project ID is required. Use global (recommended), us, or eu for Region.
+                                        <small data-i18n="For Gemini 4 Argon, Carbon, and Neon, Project ID is required. Use global (recommended), us, or eu for Region.">
+                                            For Gemini 4 Argon, Carbon, and Neon, Project ID is required. Use global (recommended), us, or eu for Region.
                                         </small>
                                     </div>
                                 </div>
@@ -3495,6 +3499,7 @@
                                     <optgroup label="Gemini 4">
                                         <option value="gemini-4-argon">gemini-4-argon</option>
                                         <option value="gemini-4-carbon">gemini-4-carbon</option>
+                                        <option value="gemini-4-neon">gemini-4-neon</option>
                                     </optgroup>
                                     <optgroup label="Gemini 3.8">
                                         <option value="gemini-3.8-flash">gemini-3.8-flash</option>

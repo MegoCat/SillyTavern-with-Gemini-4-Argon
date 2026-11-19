@@ -157,16 +157,25 @@ describe('calculateGoogleBudgetTokens', () => {
         expect(mod.calculateGoogleBudgetTokens(8192, 'medium', 'gpt-4')).toBeNull();
     });
 
-    for (const model of ['gemini-4-argon', 'gemini-4-carbon']) {
+    for (const [model, maxLevel] of [
+        ['gemini-4-argon', 'high'], ['gemini-4-carbon', 'high'], ['gemini-4-neon', 'xhigh'],
+    ]) {
         for (const [effort, level] of [
             ['auto', null], ['min', 'low'], ['low', 'low'],
-            ['medium', 'medium'], ['high', 'high'], ['max', 'high'],
+            ['medium', 'medium'], ['high', 'high'], ['max', maxLevel],
         ]) {
             test(`maps ${model} reasoning effort ${effort} to ${level}`, () => {
                 expect(mod.calculateGoogleBudgetTokens(8192, effort, model)).toBe(level);
             });
         }
     }
+
+    test('accepts native xhigh for Neon, including versioned IDs', () => {
+        expect(mod.calculateGoogleBudgetTokens(1024, 'xhigh', 'gemini-4-neon')).toBe('xhigh');
+        expect(mod.calculateGoogleBudgetTokens(1024, 'max', 'gemini-4-neon-001')).toBe('xhigh');
+        expect(mod.calculateGoogleBudgetTokens(1024, 'xhigh', 'gemini-4-carbon')).toBeNull();
+        expect(mod.calculateGoogleBudgetTokens(1024, undefined, 'gemini-4-neon')).toBeNull();
+    });
 
     describe('gemini-3 flash', () => {
         test('auto returns null', () => expect(mod.calculateGoogleBudgetTokens(8192, 'auto', 'gemini-3.5-flash')).toBeNull());
@@ -1080,7 +1089,7 @@ describe('convertGooglePrompt', () => {
         expect(result.contents.filter(c => c.role === 'user')).toHaveLength(1);
     });
 
-    for (const model of ['gemini-4-argon', 'gemini-4-carbon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']) {
+    for (const model of ['gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']) {
         test(`merges a trailing prefill into the user turn on ${model}`, () => {
             const messages = [
                 { role: 'user', content: 'Hi' },
@@ -1093,7 +1102,7 @@ describe('convertGooglePrompt', () => {
         });
     }
 
-    for (const model of ['gemini-4-argon', 'gemini-4-carbon', 'gemini-3.6-flash']) {
+    for (const model of ['gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon', 'gemini-3.6-flash']) {
         test(`keeps non-trailing model turns on ${model}`, () => {
             const messages = [
                 { role: 'user', content: 'Hi' },
@@ -1105,7 +1114,7 @@ describe('convertGooglePrompt', () => {
         });
     }
 
-    for (const model of ['gemini-4-argon', 'gemini-4-carbon']) {
+    for (const model of ['gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon']) {
         test(`preserves ${model} thought signatures in conversation history`, () => {
             const messages = [
                 { role: 'user', content: 'Hi' },
@@ -1129,6 +1138,40 @@ describe('convertGooglePrompt', () => {
             });
         });
     }
+
+    test('keeps only the first parallel call signed in each Neon model turn', () => {
+        const call = (name, signature) => ({ id: name, function: { name, arguments: '{}' }, signature });
+        const result = mod.convertGooglePrompt([
+            { role: 'user', content: 'Look these up' },
+            { role: 'assistant', tool_calls: [call('first', 'signature-1'), call('second')] },
+            { role: 'assistant', tool_calls: [call('third', 'duplicate')] },
+            { role: 'tool', tool_call_id: 'first', content: 'A' },
+            { role: 'tool', tool_call_id: 'second', content: 'B' },
+            { role: 'tool', tool_call_id: 'third', content: 'C' },
+            { role: 'assistant', tool_calls: [call('next', 'signature-2')] },
+            { role: 'tool', tool_call_id: 'next', content: 'D' },
+        ], 'gemini-4-neon', false, names);
+        expect(result.contents[1].parts.map(p => [p.functionCall.name, p.thoughtSignature])).toEqual([
+            ['first', 'signature-1'], ['second', undefined], ['third', undefined],
+        ]);
+        expect(result.contents[2].parts.map(p => p.functionResponse.name)).toEqual(['first', 'second', 'third']);
+        expect(result.contents[3].parts[0].thoughtSignature).toBe('signature-2');
+    });
+
+    test('preserves the final signed text part when Neon history messages are merged', () => {
+        const result = mod.convertGooglePrompt([
+            { role: 'user', content: 'Start' },
+            { role: 'assistant', content: 'First answer', signature: 'first-signature' },
+            { role: 'assistant', content: [{ type: 'text', text: 'More' }, { type: 'text', text: ' detail' }], signature: 'final-signature' },
+            { role: 'user', content: 'Continue' },
+            { role: 'assistant', content: 'Prefill', signature: 'old-signature' },
+        ], 'gemini-4-neon', false, names);
+        expect(result.contents[1].parts).toEqual([
+            { text: 'First answer', thoughtSignature: 'first-signature' },
+            { text: 'More' }, { text: ' detail', thoughtSignature: 'final-signature' },
+        ]);
+        expect(result.contents[2]).toEqual({ role: 'user', parts: [{ text: 'Continue\n\nPrefill' }] });
+    });
 
     test('converts image_url to inlineData', () => {
         const messages = [

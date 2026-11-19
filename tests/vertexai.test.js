@@ -21,7 +21,11 @@ jest.unstable_mockModule('../src/endpoints/secrets.js', () => ({
     readSecret: readSecretMock,
 }));
 
-describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (model) => {
+describe.each([
+    ['gemini-4-argon', 'HIGH', 32768],
+    ['gemini-4-carbon', 'HIGH', 32768],
+    ['gemini-4-neon', 'XHIGH', 65536],
+])('Vertex AI Express %s', (model, maxThinkingLevel, nonStreamingLimit) => {
     let server;
     let baseUrl;
 
@@ -218,7 +222,7 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
 
     test.each([
         [false, 'auto', null], [false, 'min', 'LOW'], [false, 'low', 'LOW'],
-        [true, 'medium', 'MEDIUM'], [true, 'high', 'HIGH'], [true, 'max', 'HIGH'],
+        [true, 'medium', 'MEDIUM'], [true, 'high', 'HIGH'], [true, 'max', maxThinkingLevel],
     ])('sends thinking levels with stream=%s and effort=%s', async (stream, effort, level) => {
         const response = await generate({ stream, reasoning_effort: effort });
         expect(response.status).toBe(200);
@@ -237,6 +241,14 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
         for (const field of ['temperature', 'topP', 'topK', 'candidateCount']) {
             expect(generationConfig).not.toHaveProperty(field);
         }
+    });
+
+    test('sends maximum effort independently of thought summaries', async () => {
+        const response = await generate({ reasoning_effort: 'max', include_reasoning: false });
+        expect(response.status).toBe(200);
+        await response.text();
+        const { generationConfig } = JSON.parse(fetchMock.mock.calls[0][1].body);
+        expect(generationConfig.thinkingConfig).toEqual({ includeThoughts: false, thinkingLevel: maxThinkingLevel });
     });
 
     test.each([
@@ -272,7 +284,7 @@ describe.each(['gemini-4-argon', 'gemini-4-carbon'])('Vertex AI Express %s', (mo
     });
 
     test.each([
-        [false, 100000, 32768], [true, 100000, 65536],
+        [false, 100000, nonStreamingLimit], [true, 100000, 65536],
         [false, undefined, undefined], [true, undefined, undefined],
     ])('respects single-request output limits with stream=%s and max_tokens=%s', async (stream, maxTokens, expected) => {
         const response = await generate({ stream, max_tokens: maxTokens });

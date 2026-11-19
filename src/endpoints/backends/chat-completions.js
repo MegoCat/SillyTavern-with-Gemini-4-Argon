@@ -68,6 +68,7 @@ import {
     getWebTokenizer,
 } from '../tokenizers.js';
 import { getGoogleApiConfig } from '../google.js';
+import { getGemini4Model } from '../../../public/scripts/util/gemini.js';
 import { getCookieSecret } from '../../users.js';
 import { fetchGoogleModels, GoogleModelsHttpError } from './google-models.js';
 
@@ -478,7 +479,8 @@ async function sendMakerSuiteRequest(request, response) {
     }
 
     const model = String(request.body.model);
-    const isGemini4 = /^gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+    const gemini4Model = getGemini4Model(model);
+    const isGemini4 = Boolean(gemini4Model);
     const stream = Boolean(request.body.stream);
     const enableWebSearch = Boolean(request.body.enable_web_search);
     const requestImages = Boolean(request.body.request_images);
@@ -506,7 +508,8 @@ async function sendMakerSuiteRequest(request, response) {
 
     // Gemini 4 requires continuation handling beyond its single-request output limits.
     if (isGemini4 && Number.isFinite(generationConfig.maxOutputTokens)) {
-        generationConfig.maxOutputTokens = Math.min(generationConfig.maxOutputTokens, stream ? 65536 : 32768);
+        const segmentLimit = stream || gemini4Model === 'gemini-4-neon' ? 65536 : 32768;
+        generationConfig.maxOutputTokens = Math.min(generationConfig.maxOutputTokens, segmentLimit);
     }
 
     function getGeminiBody() {

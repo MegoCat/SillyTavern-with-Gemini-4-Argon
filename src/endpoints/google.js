@@ -9,6 +9,7 @@ import lodash from 'lodash';
 
 import { readSecret, SECRET_KEYS } from './secrets.js';
 import { GEMINI_SAFETY, VERTEX_SAFETY } from '../constants.js';
+import { getGemini4Model } from '../../public/scripts/util/gemini.js';
 import { delay, getConfigValue, trimTrailingSlash } from '../util.js';
 
 const API_MAKERSUITE = 'https://generativelanguage.googleapis.com';
@@ -163,7 +164,7 @@ export function getProjectIdFromServiceAccount(serviceAccount) {
  */
 export async function getGoogleApiConfig(request, model, endpoint = 'generateContent') {
     const useVertexAi = request.body.api === 'vertexai' || request.body.chat_completion_source === 'vertexai';
-    const isGemini4 = /^gemini-4-(?:argon|carbon)(?:-|$)/.test(model);
+    const isGemini4 = Boolean(getGemini4Model(model));
     let region = String(request.body.vertexai_region || '').trim().toLowerCase() || 'us-central1';
     if (isGemini4 && region === 'us-central1') {
         region = 'global';
