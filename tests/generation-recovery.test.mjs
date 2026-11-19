@@ -556,23 +556,32 @@ test('a local edit during the claim is preserved and prevents apply', async () =
     assert.ok(!page.requests.some(req => req.url.endsWith('/apply')));
 });
 
-test('tool recovery is a separate account setting and respects the existing provider and generation scope', async () => {
-    const values = new Map();
+test('first-turn capture is the upgrade default, including calls declared by an extension without a local handler', async () => {
+    const values = new Map([['generation-recovery-tools', 'true']]);
     const page = await browserFixture({ values });
     const prepare = page.callbacks.get('CHAT_COMPLETION_REQUEST_READY');
     const data = { chat_completion_source: 'vertexai', tools: [{ type: 'function', function: { name: 'dice' } }] };
-    const turn = { depth: 0, allowed: true };
+    const turn = { depth: 0, allowed: false };
     await prepare(data, null, turn);
-    assert.equal(data.generation_recovery, undefined);
-    values.set('generation-recovery-tools', 'true');
-    await prepare(data, null, turn);
-    assert.equal(data.generation_recovery.context.toolDepth, 0);
+    assert.equal(data.generation_recovery.context.captureFirstToolCall, true);
+    assert.equal(data.generation_recovery.context.toolDepth, undefined);
     assert.equal(typeof turn.handle, 'function');
     for (const override of [{ type: 'quiet' }, { request_images: true }, { vertexai_auth_mode: 'full' }]) {
         const other = { ...data, ...override, generation_recovery: undefined };
         await prepare(other, null, turn);
         assert.equal(other.generation_recovery, undefined);
     }
+    const recursive = { ...data, generation_recovery: undefined };
+    await prepare(recursive, null, { depth: 1, allowed: true });
+    assert.equal(recursive.generation_recovery, undefined);
+    values.set('generation-recovery-tool-mode', 'execute');
+    await prepare(data, null, { depth: 0, allowed: true });
+    assert.equal(data.generation_recovery.context.toolDepth, 0);
+    assert.equal(data.generation_recovery.context.captureFirstToolCall, undefined);
+    values.set('generation-recovery-tool-mode', 'native');
+    const native = { ...data, generation_recovery: undefined };
+    await prepare(native, null, { depth: 0, allowed: true });
+    assert.equal(native.generation_recovery, undefined);
 });
 
 function makeToolJob(app) {
@@ -592,6 +601,123 @@ const toolParts = [
     { functionCall: { name: 'dice', args: { sides: 6 }, id: 'vertex-call-id' }, thoughtSignature: 'first-call-sig' },
     { functionCall: { name: 'dice', args: { sides: 3 } } },
 ];
+
+const capturedCall = {
+    name: 'make_scene', args: { '任意字段': [null, false, 0, { text: '雪🌟\n{{user}} ``` " \\' }], empty: {} },
+    id: 'provider-id', vendorField: { extra: true },
+};
+const capturedParts = [
+    { text: 'intermediate text' },
+    { functionCall: capturedCall, thoughtSignature: 'opaque-call-signature' },
+    { functionCall: { name: 'ignore_this', args: { second: true } } },
+];
+const eventFor = part => 'data: ' + JSON.stringify({ candidates: [{ content: { parts: [part] } }] }) + '\n\n';
+const finalEvent = 'data: {"candidates":[{"finishReason":"STOP"}]}\n\n';
+const callText = '```json\n' + JSON.stringify(capturedCall, null, 2) + '\n```';
+
+test('capturing a call keeps its fields, waits for a complete reply and preserves the ordinary text fallback', () => {
+    const mode = { captureFirstToolCall: true };
+    for (const stream of [false, true]) {
+        const plain = stream ? sse('Hello') : replyJSON();
+        assert.deepEqual(parseVertexReply(plain, stream, mode), parseVertexReply(plain, stream));
+        const body = stream ? capturedParts.map(eventFor).join('') + finalEvent : JSON.stringify({ responseContent: { parts: capturedParts } });
+        const reply = parseVertexReply(body, stream, mode);
+        assert.equal(reply.text, callText);
+        assert.equal(reply.firstToolCall, true);
+        assert.deepEqual(reply.toolCalls, []);
+        assert.equal(reply.signature, null);
+        assert.equal(reply.hasTools, false);
+        const task = { id: randomUUID(), model: 'm', createdAt: 1, updatedAt: 2 };
+        for (const type of ['continue', 'swipe']) {
+            const base = [userMessage(), assistantMessage()];
+            const message = buildRecoveredMessage(context(base, type), reply, task);
+            assert.equal(message.mes, type === 'continue' ? 'Before\n\n' + callText : callText);
+            assert.equal(message.swipes[message.swipe_id], message.mes);
+            if (type === 'swipe') assert.equal(message.swipes[0], 'Before');
+        }
+    }
+    assert.throws(() => parseVertexReply(eventFor(capturedParts[1]), true, mode), /without a final/);
+    assert.throws(() => parseVertexReply(eventFor({ functionCall: { name: 'test', willContinue: true } }) + finalEvent, true, mode), /incomplete/);
+    assert.throws(() => validateContext({ ...context(), ...mode, toolDepth: 0 }), /mode/);
+});
+
+for (const stream of [false, true]) {
+    for (const reconnect of [false, true]) {
+        test(`first function is saved once (${stream ? 'SSE' : 'JSON'}, ${reconnect ? 'reopened chat' : 'live generation'})`, async t => {
+            let sink;
+            let modelCalls = 0;
+            const app = routerFixture(t, (req, res) => {
+                modelCalls++;
+                assert.equal(req.body.tool_choice, 'required');
+                assert.equal(req.body.tools[0].function.name, capturedCall.name);
+                sink = res;
+            });
+            const pageForChat = async () => {
+                const page = await browserFixture({ respond: async (url, options) => {
+                    const route = url.replace('/api/backends/chat-completions', '');
+                    const { response } = await app.call(options.method, route, JSON.parse(options.body || '{}'));
+                    return json(response.data(), response.statusCode);
+                } });
+                page.core.redisplayChat = () => {};
+                return page;
+            };
+            let page = await pageForChat();
+            const { body } = app.generate(randomUUID(), stream);
+            body.tools = [{ type: 'function', function: { name: capturedCall.name } }];
+            body.tool_choice = 'required';
+            const turn = { depth: 0, allowed: true };
+            await page.callbacks.get('CHAT_COMPLETION_REQUEST_READY')(body, null, turn);
+            const { id } = body.generation_recovery;
+            const first = await app.call('POST', '/generate', body);
+            await nextTurn();
+            if (stream) {
+                sink.write(eventFor(capturedParts[0]));
+                page.ctx.chat.push(assistantMessage());
+                page.callbacks.get('STREAM_TOKEN_RECEIVED')();
+            }
+            if (reconnect) first.response.destroy();
+            if (stream) {
+                for (const byte of Buffer.from(capturedParts.slice(1).map(eventFor).join(''))) sink.write(Buffer.from([byte]));
+                sink.end(finalEvent);
+            } else {
+                sink.json({ responseContent: { parts: capturedParts } });
+            }
+            await nextTurn();
+            const detail = (await app.call('GET', `/recovery/${id}/result`)).response.data();
+            assert.equal(detail.reply.text, callText);
+            assert.equal(detail.task.firstToolCall, true);
+            assert.equal(detail.task.tools, undefined);
+            assert.equal((await app.call('POST', `/recovery/${id}/tools/prepare`)).response.statusCode, 409);
+            assert.equal((await app.call('POST', '/generate', body)).response.statusCode, 200);
+            if (reconnect) {
+                const original = page;
+                page = await pageForChat();
+                await page.tick();
+                // The original tab can wake after the other tab has already removed the task from the pending list.
+                original.core.is_send_press = true;
+                await turn.handle();
+                original.core.is_send_press = false;
+                await original.tick();
+                assert.equal(original.ctx.chat.at(-1).mes, callText);
+            } else {
+                page.core.is_send_press = true;
+                assert.equal(await turn.handle(), callText);
+                page.core.is_send_press = false;
+            }
+            assert.equal(page.ctx.chat.length, 2);
+            assert.equal(page.ctx.chat[1].mes, callText);
+            assert.equal(page.ctx.chat[1].extra.tool_invocations, undefined);
+            assert.ok(hasCompletedTask(page.ctx.chat[1], id));
+            const again = await pageForChat();
+            await again.tick();
+            assert.ok(!again.requests.some(request => request.url.endsWith('/apply')));
+            const rows = fs.readFileSync(app.filename, 'utf8').split('\n').map(JSON.parse);
+            assert.equal(rows.length, 3);
+            assert.deepEqual(rows[2], page.ctx.chat[1]);
+            assert.equal(modelCalls, 1);
+        });
+    }
+}
 
 test('tool calls survive SSE chunk boundaries with separate ordered IDs, arguments and signatures', () => {
     const event = part => `data: ${JSON.stringify({ candidates: [{ content: { parts: [part] } }] })}\n\n`;

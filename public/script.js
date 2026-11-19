@@ -1802,6 +1802,24 @@ export function messageFormatting(mes, ch_name, isSystem, isUser, messageId, san
         return '';
     }
 
+    // A returned function is literal JSON. Chat regexes, quote markup and HTML entity decoding can corrupt its arguments.
+    const message = chat[messageId];
+    const callOffsets = message?.extra?.generation_call_blocks;
+    if (!isReasoning && mes === message?.mes && Array.isArray(callOffsets)) {
+        const sections = [];
+        let end = 0;
+        const formatProse = text => messageFormatting(text, ch_name, isSystem, isUser, messageId, sanitizerOverrides);
+        for (const start of callOffsets) {
+            if (!Number.isSafeInteger(start) || start < end || !mes.startsWith('```json\n', start)) continue;
+            const jsonStart = start + '```json\n'.length;
+            const jsonEnd = mes.indexOf('\n```', jsonStart);
+            if (jsonEnd < 0) continue;
+            sections.push(formatProse(mes.slice(end, start)), `<pre><code class="language-json">${escapeHtml(mes.slice(jsonStart, jsonEnd))}</code></pre>`);
+            end = jsonEnd + '\n```'.length;
+        }
+        if (sections.length) return sections.join('') + formatProse(mes.slice(end));
+    }
+
     if (Number(messageId) === 0 && !isSystem && !isUser && !isReasoning) {
         const mesBeforeReplace = mes;
         const chatMessage = chat[messageId];
@@ -4500,8 +4518,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
     async function finishTrackedTools() {
         streamingProcessor = null;
         try {
-            const parent = await toolTurn.handle();
-            if (parent) return await Generate('normal', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth: depth + 1, toolRecoveryParent: parent });
+            const result = await toolTurn.handle();
+            if (typeof result === 'string') return result;
+            if (result) return await Generate('normal', { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName, depth: depth + 1, toolRecoveryParent: result });
         } finally {
             unblockGeneration(type);
         }

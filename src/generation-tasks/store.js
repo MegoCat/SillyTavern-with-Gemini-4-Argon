@@ -46,10 +46,12 @@ export function validateContext(context) {
     if (['continue', 'swipe'].includes(context.type) && (!context.baseLast || context.baseLast.is_user)) throw taskError('Recovery needs an assistant message to continue or swipe.');
     if (Buffer.byteLength(JSON.stringify(context)) > 1024 * 1024) throw taskError('Recovery metadata is too large.', 413);
     if (context.toolDepth !== undefined && (!Number.isSafeInteger(context.toolDepth) || context.toolDepth < 0 || context.toolDepth > 50)) throw taskError('Invalid tool recursion depth.');
+    if (context.captureFirstToolCall !== undefined && (context.captureFirstToolCall !== true || context.toolDepth !== undefined)) throw taskError('Invalid first function call recovery mode.');
     // Whitelist fields; do not accidentally persist request secrets added by an extension.
     return {
         version: RECOVERY_VERSION, type: context.type,
         ...(context.toolDepth !== undefined ? { toolDepth: context.toolDepth } : {}),
+        ...(context.captureFirstToolCall ? { captureFirstToolCall: true } : {}),
         chat: { avatar: context.chat.avatar, fileName: context.chat.fileName },
         baseLength: context.baseLength, baseHash: context.baseHash, prefixHash: context.prefixHash,
         characterName: context.characterName,
@@ -174,7 +176,8 @@ export class GenerationTaskStore {
         try {
             if (!error && sink.statusCode >= 400) error = new Error(`The model request failed (HTTP ${sink.statusCode}).`);
             if (!error) {
-                const reply = parseVertexReply(body.toString('utf8'), record.stream);
+                const reply = parseVertexReply(body.toString('utf8'), record.stream, record.context);
+                if (reply.firstToolCall) record.firstToolCall = true;
                 if (record.context.toolDepth !== undefined && reply.hasTools) {
                     if (reply.hasImages || reply.toolCalls.some(call => !record.offeredTools.includes(call.name))) throw new Error('The model returned media or an undeclared function tool.');
                     record.toolRound = { nextId: randomUUID(), count: reply.toolCalls.length, steps: [] };
@@ -235,8 +238,8 @@ export class GenerationTaskStore {
         validateId(client);
         const record = this.require(id);
         if (record.status !== 'completed' || record.acknowledged) throw taskError('No completed result is available.', 409);
-        // Give the original response handler a chance to save before another tab restores it.
-        if (Date.now() - record.updatedAt < 3000) throw taskError('The original client may still be saving this reply.', 409);
+        // Text may still be saving normally. For a captured call every tab, including the original, uses /apply.
+        if (!record.firstToolCall && Date.now() - record.updatedAt < 3000) throw taskError('The original client may still be saving this reply.', 409);
         const existing = this.leases.get(id);
         if (existing && existing.expires > Date.now() && existing.client !== client) throw taskError('Another tab is restoring this reply.', 409);
         const lease = { client, token: existing?.client === client ? existing.token : randomUUID(), expires: Date.now() + 30000 };

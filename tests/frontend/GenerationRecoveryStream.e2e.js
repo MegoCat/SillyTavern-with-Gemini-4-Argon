@@ -1,6 +1,26 @@
 import { expect, test } from '@playwright/test';
 import { testSetup } from './frontent-test-utils.js';
 
+test('copied function JSON preserves Markdown, macros, and literal HTML inside arguments', async ({ page }) => {
+    await testSetup.awaitST({ page });
+    const args = { script: '```js\nlet value = "<b>&amp;</b>";\n```', story: '{{user}} 🌟', data: [false, null, 0] };
+    const displayed = await page.evaluate(async args => {
+        const { chat, messageFormatting } = await import('/script.js');
+        const text = '```json\n' + JSON.stringify({ name: 'capture', args }, null, 2) + '\n```';
+        const prefix = '**Existing reply**\n\n';
+        const mes = prefix + text + '\n\n' + text;
+        const id = chat.push({ mes, extra: { generation_call_blocks: [prefix.length, prefix.length + text.length + 2] } }) - 1;
+        try {
+            const el = document.createElement('div');
+            el.innerHTML = messageFormatting(mes, 'Character', false, false, id);
+            return { prefix: el.querySelector('strong')?.textContent, values: Array.from(el.querySelectorAll('pre code'), code => JSON.parse(code.textContent)) };
+        } finally {
+            chat.pop();
+        }
+    }, args);
+    expect(displayed).toEqual({ prefix: 'Existing reply', values: [{ name: 'capture', args }, { name: 'capture', args }] });
+});
+
 test('chat completions distinguishes a truncated recovery stream from legacy EOF', async ({ page }) => {
     const chunk = 'data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}\n\n';
     const tracked = { 'X-Generation-Stream-End': 'generation-complete' };

@@ -79,16 +79,23 @@ export function planRecovery(messages, context, id, hash) {
 }
 
 /** Parse a complete Vertex response, retaining all text parts and the opaque signature. */
-export function parseVertexReply(body, stream) {
+export function parseVertexReply(body, stream, { captureFirstToolCall = false } = {}) {
     const result = { text: '', reasoning: '', signature: null, finishReason: null, hasTools: false, toolCalls: [], hasImages: false };
     let sawTerminal = !stream;
+    let firstCall;
     const consumeParts = (parts) => {
         for (const part of parts ?? []) {
-            if (part.functionCall) {
+            if (part.functionCall && !firstCall) {
                 const { name, args = {}, id } = part.functionCall;
                 if (typeof name !== 'string' || !name || !args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Invalid Vertex function call.');
-                result.toolCalls.push({ name, args, id, signature: part.thoughtSignature ?? null });
-                result.hasTools = true;
+                if (captureFirstToolCall) {
+                    // This backend requests complete Vertex arguments. Never publish a partial argument delta as a finished call.
+                    if (part.functionCall.willContinue || part.functionCall.partialArgs?.length) throw new Error('Vertex returned incomplete function arguments.');
+                    firstCall = part.functionCall;
+                } else {
+                    result.toolCalls.push({ name, args, id, signature: part.thoughtSignature ?? null });
+                    result.hasTools = true;
+                }
             }
             if (part.inlineData || part.fileData) result.hasImages = true;
             if (typeof part.text === 'string') {
@@ -128,6 +135,10 @@ export function parseVertexReply(body, stream) {
         consume(JSON.parse(body));
     }
     if (!sawTerminal) throw new Error('The upstream stream ended without a final result. Partial text will not be restored automatically.');
+    if (firstCall) {
+        // Keep provider-specific fields, and keep call signatures and executable tool metadata out of chat history.
+        return { ...result, firstToolCall: true, text: '```json\n' + JSON.stringify(firstCall, null, 2) + '\n```', reasoning: '', signature: null, hasImages: false };
+    }
     if (!result.text && !result.reasoning && !result.hasTools && !result.hasImages) throw new Error('The model returned no reply.');
     return result;
 }
@@ -145,6 +156,16 @@ export function buildRecoveredMessage(context, reply, task, { text = reply.text,
     if (!message || message.is_user) throw new Error('The original assistant message is unavailable.');
     message.extra ??= {};
     const previousReasoning = context.type === 'continue' ? (message.extra.reasoning ?? '') : '';
+    if (reply.firstToolCall) {
+        const prefix = context.type === 'continue' && message.mes ? message.mes + '\n\n' : '';
+        text = prefix + reply.text;
+        const previous = context.type === 'continue' && Array.isArray(message.extra.generation_call_blocks) ? message.extra.generation_call_blocks : [];
+        message.extra.generation_call_blocks = [...previous, prefix.length];
+        delete message.extra.display_text;
+        delete message.extra.tool_invocations;
+    } else if (context.type === 'swipe') {
+        delete message.extra.generation_call_blocks;
+    }
     message.mes = text;
     message.send_date = new Date(task.updatedAt).toISOString();
     message.gen_started = new Date(task.createdAt).toISOString();

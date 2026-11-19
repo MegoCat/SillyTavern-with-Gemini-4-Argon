@@ -118,7 +118,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         const store = storeFor(req);
         const task = store.require(req.params.id);
         if (task.status !== 'completed') throw taskError(task.error || 'No final reply is available.', 409);
-        res.json({ task: store.summary(task, true), reply: parseVertexReply(store.result(task.id).toString('utf8'), task.stream) });
+        res.json({ task: store.summary(task, true), reply: parseVertexReply(store.result(task.id).toString('utf8'), task.stream, task.context) });
     }));
     router.post('/recovery/:id/cancel', route((req, res) => {
         const store = storeFor(req);
@@ -158,9 +158,10 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
             return res.json({ ok: true, alreadySaved: true });
         }
         store.checkLease(task.id, req.body?.token);
-        const reply = parseVertexReply(store.result(task.id).toString('utf8'), task.stream);
-        if (typeof req.body?.text !== 'string' || typeof req.body?.reasoning !== 'string'
-            || Buffer.byteLength(req.body.text + req.body.reasoning) > store.options.maxBytes) throw taskError('Invalid restored message.');
+        const reply = parseVertexReply(store.result(task.id).toString('utf8'), task.stream, task.context);
+        const { text, reasoning } = req.body ?? {};
+        if (!reply.firstToolCall && (typeof text !== 'string' || typeof reasoning !== 'string'
+            || Buffer.byteLength(text + reasoning) > store.options.maxBytes)) throw taskError('Invalid restored message.');
         const context = { ...task.context };
         if (context.baseLast && saved.messages[edit.index]) {
             const original = context.baseLast;
@@ -172,7 +173,7 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
                 extra: { ...original.extra, ...current.extra, reasoning: original.extra?.reasoning, reasoning_signature: original.extra?.reasoning_signature },
             };
         }
-        const message = buildRecoveredMessage(context, reply, task, { text: req.body.text, reasoning: req.body.reasoning });
+        const message = buildRecoveredMessage(context, reply, task, reply.firstToolCall ? undefined : { text, reasoning });
         if (edit.kind === 'append') saved.messages.push(message);
         else saved.messages[edit.index] = message;
         // No await between reading/checking and replacing the file: the operation is atomic in this server process.
@@ -188,7 +189,8 @@ export function buildGenerationRecoveryRouter(backendRouter, makeRouter, sanitiz
         if (req.body.chat_completion_source !== 'vertexai' || (req.body.vertexai_auth_mode || 'express') !== 'express'
             || req.body.request_images) throw taskError('Recovery requires a Vertex AI Express text request.');
         if (req.body.tools != null && !Array.isArray(req.body.tools)) throw taskError('Invalid function tool declarations.');
-        if (req.body.tools?.length && recovery.context?.toolDepth === undefined) throw taskError('Tool recovery was not enabled for this request.');
+        if (recovery.context?.captureFirstToolCall && (!req.body.tools?.length || recovery.parentId)) throw taskError('First function call recovery requires an initial request with tools.');
+        if (req.body.tools?.length && recovery.context?.toolDepth === undefined && !recovery.context?.captureFirstToolCall) throw taskError('Tool recovery was not enabled for this request.');
         const body = { ...req.body };
         delete body.generation_recovery;
         if ((body.type || 'normal') !== recovery.context?.type) throw taskError('Recovery generation type does not match the request.');

@@ -3156,7 +3156,8 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, to
         || generate_data.chat_completion_source !== 'vertexai' || generate_data.model !== toolTurn.parent.model)) {
         throw new Error('工具恢复需要原来的 Vertex AI 快速模式和模型。');
     }
-    if (toolTurn?.handle && !toolTurn.allowed) {
+    const captureFirstToolCall = generate_data.generation_recovery?.context?.captureFirstToolCall;
+    if (toolTurn?.handle && !toolTurn.allowed && !captureFirstToolCall) {
         delete generate_data.tools;
         delete generate_data.tool_choice;
     }
@@ -3206,7 +3207,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, to
                 }
 
                 if (toolTurn?.handle && parsed.candidates?.[0]?.content?.parts?.some(part => part.functionCall)) toolTurn.detected = true;
-                ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
+                if (!captureFirstToolCall) ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
 
                 yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
             }
