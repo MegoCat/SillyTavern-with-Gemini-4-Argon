@@ -80,8 +80,7 @@ export function observeGenerationResponse(request, response, next) {
     // Gemini may close cleanly after partial text or send a finish reason with no reply.
     let waitingForFinishReason = geminiStream;
     const report = (status) => {
-        // A recovery task notifies on its own terminal event, independent of all HTTP subscribers.
-        if (notified || request.socket.destroyed || response.hasHeader('X-Generation-Task-Id')) return;
+        if (notified || request.socket.destroyed) return;
         notified = true;
         notify(status);
     };

@@ -49,7 +49,7 @@ function print(message) {
     console.info(message);
 }
 
-/** Server-observed timings for one Vertex Express request, including a detached recovery response. */
+/** Server-observed timings for one Vertex Express request. */
 export class VertexProgress {
     constructor(response, model, stream) {
         this.id = ++nextId;
@@ -71,16 +71,13 @@ export class VertexProgress {
         const onFinish = () => this.finish(response.statusCode >= 400 ? 'failed' : 'done');
         const onClose = () => this.finish('cancelled');
         const onError = () => this.finish('failed');
-        const onTerminal = record => this.finish(record.status === 'completed' ? 'done' : record.status);
         response.once('finish', onFinish);
         response.once('close', onClose);
         response.once('error', onError);
-        response.once('terminal', onTerminal);
         this.cleanup = () => {
             response.off('finish', onFinish);
             response.off('close', onClose);
             response.off('error', onError);
-            response.off('terminal', onTerminal);
         };
         if (response.destroyed) onClose();
     }

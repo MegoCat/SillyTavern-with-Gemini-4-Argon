@@ -344,11 +344,6 @@ export class ToolManager {
         }
     }
 
-    /** Whether the named tool is currently available for a model request. */
-    static async isToolAvailable(name) {
-        return Boolean(await this.#tools.get(name)?.shouldRegister());
-    }
-
     /**
      * Checks if a tool is a stealth tool.
      * @param {string} name The name of the tool to check.
@@ -898,7 +893,10 @@ export class ToolManager {
         return detailsElement.outerHTML;
     }
 
-    /** Build the same tool transcript for live delivery and recovery. */
+    /**
+     * Builds a system message with the tool transcript and the original invocations.
+     * @param {ToolInvocation[]} invocations Successful tool invocations
+     */
     static createToolInvocationMessage(invocations) {
         return {
             name: systemUserName,

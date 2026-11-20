@@ -6,6 +6,7 @@ import sanitize from 'sanitize-filename';
 import { CheckRepoActions, default as simpleGit } from 'simple-git';
 
 import { PUBLIC_DIRECTORIES } from '../constants.js';
+import { RETIRED_BUILTIN_EXTENSIONS } from '../../public/scripts/constants.js';
 import { color, getConfigValue, isValidUrl } from '../util.js';
 import { createGitClient } from '../git/client.js';
 
@@ -506,7 +507,7 @@ router.get('/discover', function (request, response) {
     const builtInExtensions = fs
         .readdirSync(PUBLIC_DIRECTORIES.extensions)
         .filter(f => fs.statSync(path.join(PUBLIC_DIRECTORIES.extensions, f)).isDirectory())
-        .filter(f => f !== 'third-party')
+        .filter(f => f !== 'third-party' && !RETIRED_BUILTIN_EXTENSIONS.includes(f))
         .filter(f => hasManifest(PUBLIC_DIRECTORIES.extensions, f))
         .map(f => ({ type: 'system', name: f }));
 

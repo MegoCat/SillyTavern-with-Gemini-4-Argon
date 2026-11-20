@@ -167,6 +167,20 @@ declare global {
     // Global namespace modules
     interface Window {
         ai: any;
+        documentPictureInPicture?: {
+            readonly window: Window | null;
+            requestWindow(options: { width: number; height: number }): Promise<Window>;
+        };
+    }
+
+    interface HTMLVideoElement {
+        readonly webkitPresentationMode?: string;
+        webkitSetPresentationMode?(mode: 'picture-in-picture' | 'inline'): void;
+        webkitSupportsPresentationMode?(mode: 'picture-in-picture'): boolean;
+    }
+
+    interface MediaSession {
+        setActionHandler(action: 'enterpictureinpicture', handler: MediaSessionActionHandler | null): void;
     }
 
     var pdfjsLib;

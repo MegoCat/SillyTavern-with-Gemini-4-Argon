@@ -24,6 +24,9 @@ export const debounce_timeout = {
  */
 export const IGNORE_SYMBOL = Symbol.for('ignore');
 
+// Copying an update over an existing install can leave retired built-in manifests on disk.
+export const RETIRED_BUILTIN_EXTENSIONS = Object.freeze(['generation-recovery']);
+
 /**
  * Common video file extensions. Should be the same as supported by Gemini.
  * https://ai.google.dev/gemini-api/docs/video-understanding#supported-formats

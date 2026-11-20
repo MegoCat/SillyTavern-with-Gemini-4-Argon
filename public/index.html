@@ -5296,6 +5296,16 @@
                                 <input id="termux_notifications" type="checkbox" />
                                 <small data-i18n="Termux reply notifications">Termux reply notifications</small>
                             </label>
+                            <div id="background_pip_controls">
+                                <label for="background_pip_auto" class="checkbox_label">
+                                    <input id="background_pip_auto" type="checkbox" aria-describedby="background_pip_status" disabled>
+                                    <small data-i18n="Open Picture-in-Picture when switching away">Open Picture-in-Picture when switching away</small>
+                                </label>
+                                <button id="background_pip_open" type="button" class="menu_button whitespacenowrap" aria-describedby="background_pip_status" disabled>
+                                    <small data-i18n="Open Picture-in-Picture now">Open Picture-in-Picture now</small>
+                                </button>
+                                <small id="background_pip_status" role="status" hidden></small>
+                            </div>
                             <label class="checkbox_label" for="relaxed_api_urls" title="Reduce the formatting requirements on API URLs." data-i18n="[title]Reduce the formatting requirements on API URLs">
                                 <input id="relaxed_api_urls" type="checkbox" />
                                 <small data-i18n="Relaxed API URLS">Relaxed API URLs</small>

@@ -1,9 +1,16 @@
 import { createInterface } from 'node:readline';
 import { tryParse } from '../../util.js';
-import { stableStringify } from '../../../public/scripts/util/generation-recovery.js';
 
 function isObject(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// SSE events can repeat the same metadata with a different order of object keys.
+function metadataKey(metadata) {
+    return JSON.stringify(metadata, (_, value) => {
+        if (!isObject(value)) return value;
+        return Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]));
+    });
 }
 
 // An event can update just one nested field. Arrays and scalar values are snapshots.
@@ -94,7 +101,7 @@ export class VertexResponseMetadata {
                     const meta = partMetadata(part);
                     if (meta === undefined) continue;
                     if (!entry.parts.has(key)) entry.parts.set(key, new Map());
-                    entry.parts.get(key).set(stableStringify(meta), meta);
+                    entry.parts.get(key).set(metadataKey(meta), meta);
                 }
             }
             entry.fields = mergeFields(entry.fields, fields);

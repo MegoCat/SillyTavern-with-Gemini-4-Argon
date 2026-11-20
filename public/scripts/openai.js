@@ -3138,7 +3138,7 @@ export async function createGenerationParameters(settings, model, type, messages
  * @returns {Promise<unknown>}
  * @throws {Error}
  */
-async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, toolTurn } = {}) {
+async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } = {}) {
     // Provide default abort signal
     if (!signal) {
         signal = new AbortController().signal;
@@ -3146,21 +3146,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, to
 
     const model = getChatCompletionModel(oai_settings);
     const { generate_data, stream, canMultiSwipe } = await createGenerationParameters(oai_settings, model, type, messages, { jsonSchema });
-    const preparation = new AbortController();
-    await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data, preparation);
-    preparation.signal.throwIfAborted();
-    // Determine recoverability after all extensions have finished configuring tools and media.
-    await eventSource.emit(event_types.CHAT_COMPLETION_REQUEST_READY, generate_data, preparation, toolTurn);
-    preparation.signal.throwIfAborted();
-    if (toolTurn?.parent && (generate_data.generation_recovery?.parentId !== toolTurn.parent.id
-        || generate_data.chat_completion_source !== 'vertexai' || generate_data.model !== toolTurn.parent.model)) {
-        throw new Error('工具恢复需要原来的 Vertex AI 快速模式和模型。');
-    }
-    const captureFirstToolCall = generate_data.generation_recovery?.context?.captureFirstToolCall;
-    if (toolTurn?.handle && !toolTurn.allowed && !captureFirstToolCall) {
-        delete generate_data.tools;
-        delete generate_data.tool_choice;
-    }
+    await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
 
     const generate_url = '/api/backends/chat-completions/generate';
     const response = await fetch(generate_url, {
@@ -3175,7 +3161,6 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, to
         throw new Error(`Got response status ${response.status}`);
     }
     if (stream) {
-        const endEvent = response.headers.get('X-Generation-Stream-End');
         const eventStream = getEventSourceStream();
         response.body.pipeThrough(eventStream);
         const reader = eventStream.readable.getReader();
@@ -3186,15 +3171,9 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, to
             const state = { reasoning: '', images: [], signature: '', toolSignatures: {} };
             while (true) {
                 const { done, value } = await reader.read();
-                if (done) {
-                    if (endEvent) throw new Error('The connection closed before the final reply arrived. Generation recovery will check the server.');
-                    return;
-                }
+                if (done) return;
                 const rawData = value.data;
-                if (rawData === '[DONE]') {
-                    if (!endEvent || value.type === endEvent) return;
-                    continue;
-                }
+                if (rawData === '[DONE]') return;
                 tryParseStreamingError(response, rawData);
                 const parsed = JSON.parse(rawData);
 
@@ -3206,8 +3185,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, to
                     text += getStreamingReply(parsed, state);
                 }
 
-                if (toolTurn?.handle && parsed.candidates?.[0]?.content?.parts?.some(part => part.functionCall)) toolTurn.detected = true;
-                if (!captureFirstToolCall) ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
+                ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
 
                 yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
             }

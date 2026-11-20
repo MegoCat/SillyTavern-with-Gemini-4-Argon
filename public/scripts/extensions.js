@@ -7,7 +7,7 @@ import { delay, deleteValueByPath, equalsIgnoreCaseAndAccents, escapeHtml, isSub
 import { getContext } from './st-context.js';
 import { isAdmin } from './user.js';
 import { addLocaleData, getCurrentLocale, t } from './i18n.js';
-import { debounce_timeout } from './constants.js';
+import { debounce_timeout, RETIRED_BUILTIN_EXTENSIONS } from './constants.js';
 import { accountStorage } from './util/AccountStorage.js';
 import { SimpleMutex } from './util/SimpleMutex.js';
 
@@ -301,7 +301,8 @@ async function discoverExtensions() {
 
         if (response.ok) {
             const extensions = await response.json();
-            return extensions;
+            // An older server or a cached discovery response can still list a retired built-in.
+            return extensions.filter(({ name }) => !RETIRED_BUILTIN_EXTENSIONS.includes(name));
         } else {
             return [];
         }

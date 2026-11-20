@@ -9,10 +9,17 @@ import { afterAll, beforeAll, describe, expect, test } from '@jest/globals';
 process.env.SILLYTAVERN_GIT_BACKEND = 'auto';
 process.env.SILLYTAVERN_EXTENSIONS_ENABLED = 'true';
 
-// The extensions endpoint resolves the built-in extensions folder relative to the repo root
+// The extensions endpoint resolves built-ins relative to the working directory.
 const originalCwd = process.cwd();
-beforeAll(() => process.chdir(path.resolve(originalCwd, '..')));
-afterAll(() => process.chdir(originalCwd));
+let fixtureRoot;
+beforeAll(() => {
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'st-extensions-'));
+    process.chdir(fixtureRoot);
+});
+afterAll(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+});
 
 describe('extensions discover', () => {
     /** @type {import('node:http').Server} */
@@ -21,7 +28,14 @@ describe('extensions discover', () => {
     let userExtensionsDir;
 
     beforeAll(async () => {
-        userExtensionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st-extensions-'));
+        userExtensionsDir = path.join(fixtureRoot, 'user-extensions');
+        fs.mkdirSync(userExtensionsDir);
+
+        const builtInDir = path.join(fixtureRoot, 'public', 'scripts', 'extensions');
+        for (const folder of ['regex', 'generation-recovery']) {
+            fs.mkdirSync(path.join(builtInDir, folder), { recursive: true });
+            fs.writeFileSync(path.join(builtInDir, folder, 'manifest.json'), JSON.stringify({ display_name: folder }));
+        }
 
         // A valid extension with a manifest
         fs.mkdirSync(path.join(userExtensionsDir, 'Valid-Extension'));
@@ -49,7 +63,6 @@ describe('extensions discover', () => {
 
     afterAll(async () => {
         await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-        fs.rmSync(userExtensionsDir, { recursive: true, force: true });
     });
 
     test('lists folders with a manifest and skips folders without one', async () => {
@@ -59,5 +72,12 @@ describe('extensions discover', () => {
         const names = extensions.map(x => x.name);
         expect(names).toContain('third-party/Valid-Extension');
         expect(names).not.toContain('third-party/Deleted-Husk');
+    });
+
+    test('skips the retired built-in even when an update left its manifest on disk', async () => {
+        const response = await fetch(`${baseUrl}/discover`);
+        const extensions = await response.json();
+        expect(extensions).toContainEqual({ type: 'system', name: 'regex' });
+        expect(extensions).not.toContainEqual({ type: 'system', name: 'generation-recovery' });
     });
 });
