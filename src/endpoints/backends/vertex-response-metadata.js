@@ -15,9 +15,34 @@ function mergeFields(previous, next) {
     return { ...previous, ...Object.fromEntries(entries) };
 }
 
-function partMetadata(part) {
+function partForLog(part) {
     if (!isObject(part)) return part;
     const fields = { ...part };
+    delete fields.thoughtSignature;
+    delete fields.thought_signature;
+    return fields;
+}
+
+/** Keep text and media in full Google response logs, omitting the opaque signature on each part. */
+export function googleResponseForLog(packet) {
+    if (!Array.isArray(packet?.candidates)) return packet;
+    const candidates = packet.candidates.map(candidate => {
+        if (!isObject(candidate)) return candidate;
+        const fields = { ...candidate };
+        for (const key of ['content', 'output']) {
+            const content = candidate[key];
+            if (Array.isArray(content?.parts)) {
+                fields[key] = { ...content, parts: content.parts.map(partForLog) };
+            }
+        }
+        return fields;
+    });
+    return { ...packet, candidates };
+}
+
+function partMetadata(part) {
+    const fields = partForLog(part);
+    if (!isObject(fields)) return fields;
     if (typeof part.text === 'string') delete fields.text;
     if (typeof part.inlineData?.data === 'string') {
         fields.inlineData = { ...part.inlineData };
@@ -26,7 +51,7 @@ function partMetadata(part) {
     return Object.keys(fields).length ? fields : undefined;
 }
 
-/** Keep provider-defined fields, without collecting the chat text or inline media bytes. */
+/** Collect provider metadata for the terminal, omitting chat text, thought signatures and inline media bytes. */
 export class VertexResponseMetadata {
     /** @type {Record<string, any>} */
     fields = {};

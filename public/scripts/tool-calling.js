@@ -806,7 +806,8 @@ export class ToolManager {
                 continue;
             }
 
-            console.log('[ToolManager] Function tool call:', toolCall);
+            const { signature, ...callDetails } = toolCall;
+            console.log('[ToolManager] Function tool call:', callDetails);
             const id = toolCall.id;
             const parameters = toolCall.function.arguments;
             const name = toolCall.function.name;
@@ -816,7 +817,7 @@ export class ToolManager {
             const toast = message && toastr.info(message, 'Tool Calling', { timeOut: 0 });
             const toolResult = await ToolManager.invokeFunctionTool(name, parameters);
             toastr.clear(toast);
-            console.log('[ToolManager] Function tool result:', result);
+            console.log('[ToolManager] Function tool result:', toolResult);
 
             // Handle tool errors — still create an invocation so the LLM sees the failure
             if (toolResult instanceof Error) {
@@ -831,7 +832,7 @@ export class ToolManager {
                         parameters: stringify(parameters),
                         result: toolResult.toString(),
                         error: true,
-                        signature: toolCall.signature || null,
+                        signature: signature || null,
                         reasoning: reasoningText || null,
                     });
                 }
@@ -851,7 +852,7 @@ export class ToolManager {
                 parameters: stringify(parameters),
                 result: toolResult,
                 error: false,
-                signature: toolCall.signature || null,
+                signature: signature || null,
                 reasoning: reasoningText || null,
             };
             result.invocations.push(invocation);
@@ -879,16 +880,16 @@ export class ToolManager {
      * @returns {string} Formatted message with tool invocations.
      */
     static #formatToolInvocationMessage(invocations) {
-        const data = structuredClone(invocations);
+        const data = invocations.map(({ signature, ...details }) => {
+            details.parameters = tryParse(details.parameters);
+            details.result = tryParse(details.result);
+            return details;
+        });
         const detailsElement = document.createElement('details');
         const summaryElement = document.createElement('summary');
         const preElement = document.createElement('pre');
         const codeElement = document.createElement('code');
         codeElement.classList.add('language-json');
-        data.forEach(i => {
-            i.parameters = tryParse(i.parameters);
-            i.result = tryParse(i.result);
-        });
         codeElement.textContent = JSON.stringify(data, null, 2);
         const toolNames = data.map(i => i.displayName || i.name);
         summaryElement.textContent = `Tool calls: ${this.#groupToolNames(toolNames)}`;

@@ -32,3 +32,20 @@ test('selects Neon in Vertex Express and sends maximum effort with thought summa
     });
     expect(signature).toBe('text-signature');
 });
+
+test('tool call details omit the thought signature and keep the signed invocation for the next turn', async ({ page }) => {
+    await testSetup.awaitST({ page });
+    const result = await page.evaluate(async () => {
+        const { ToolManager } = await import('/scripts/tool-calling.js');
+        const message = ToolManager.createToolInvocationMessage([{
+            name: 'verify', parameters: '{"signature":"document"}', result: '{"valid":true}',
+            reasoning: 'Checked the document', signature: 'opaque-tool-signature',
+        }]);
+        const doc = new DOMParser().parseFromString(message.mes, 'text/html');
+        return { details: JSON.parse(doc.querySelector('code').textContent), signature: message.extra.tool_invocations[0].signature };
+    });
+    expect(result.details).toEqual([{
+        name: 'verify', parameters: { signature: 'document' }, result: { valid: true }, reasoning: 'Checked the document',
+    }]);
+    expect(result.signature).toBe('opaque-tool-signature');
+});

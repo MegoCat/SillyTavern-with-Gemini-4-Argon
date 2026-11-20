@@ -89,7 +89,7 @@ describe.each([
         };
     }
 
-    test.each([false, true])('reports provider-defined metadata once and preserves the web response, stream=%s', async (stream) => {
+    test.each([false, true])('omits thought signatures from terminal metadata and preserves the web response, stream=%s', async (stream) => {
         jest.replaceProperty(process, 'env', { ...process.env, TERM: 'dumb' });
         const logs = jest.spyOn(console, 'info').mockImplementation(() => {});
         const signature = 'Ag+/long-signature=='.repeat(620);
@@ -131,9 +131,27 @@ describe.each([
         const metadata = JSON.parse(reports[0].split('API metadata ')[1]);
         expect(metadata).toEqual({
             ...full, candidates: [{ ...last.candidates[0], content: { role: 'model', parts: [
-                { thoughtSignature: signature, futurePartField: false }, { inlineData: { mimeType: 'image/png', extra: 0 } },
+                { futurePartField: false }, { inlineData: { mimeType: 'image/png', extra: 0 } },
             ] } }],
         });
+    });
+
+    test('omits part signatures from full Google response logs and warnings', async () => {
+        const debug = jest.spyOn(console, 'debug').mockImplementation(() => {});
+        const warnings = jest.spyOn(console, 'warn').mockImplementation(() => {});
+        const part = { thought: true, text: 'Thinking', thoughtSignature: 'opaque-signature' };
+        const packet = { candidates: [{ content: { parts: [part] } }] };
+        fetchMock.mockResolvedValueOnce({ ok: true, json: async () => packet });
+        await (await generate({ chat_completion_source: 'makersuite' })).json();
+
+        const responseLog = debug.mock.calls.find(([label]) => label === 'Google AI Studio response:')[1];
+        expect(responseLog).toContain('Thinking');
+        expect(responseLog).not.toContain('thoughtSignature');
+        expect(responseLog).not.toContain('opaque-signature');
+        expect(warnings).toHaveBeenCalledWith('Google AI Studio Candidate text empty', {
+            candidates: [{ content: { parts: [{ thought: true, text: 'Thinking' }] } }],
+        });
+        expect(part.thoughtSignature).toBe('opaque-signature');
     });
 
     test('reports a blocked reply with only the metadata supplied by the model', async () => {

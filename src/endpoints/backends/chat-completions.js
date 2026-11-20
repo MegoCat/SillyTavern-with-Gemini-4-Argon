@@ -72,6 +72,7 @@ import { getGemini4Model } from '../../../public/scripts/util/gemini.js';
 import { getCookieSecret } from '../../users.js';
 import { fetchGoogleModels, GoogleModelsHttpError } from './google-models.js';
 import { VertexProgress } from './vertex-progress.js';
+import { googleResponseForLog } from './vertex-response-metadata.js';
 
 const API_OPENAI = 'https://api.openai.com/v1';
 const API_CLAUDE = 'https://api.anthropic.com/v1';
@@ -746,11 +747,11 @@ async function sendMakerSuiteRequest(request, response) {
             const generateResponseJson = await generateResponse.json();
 
             const capturedMetadata = progress?.metadata?.add(generateResponseJson);
-            const warningDetails = capturedMetadata ? [] : [generateResponseJson];
+            const logDetails = capturedMetadata ? [] : [googleResponseForLog(generateResponseJson)];
             const candidates = generateResponseJson?.candidates;
             if (!candidates || candidates.length === 0) {
                 let message = `${apiName} API returned no candidate`;
-                console.warn(message, ...warningDetails);
+                console.warn(message, ...logDetails);
                 if (generateResponseJson?.promptFeedback?.blockReason) {
                     message += `\nPrompt was blocked due to : ${generateResponseJson.promptFeedback.blockReason}`;
                 }
@@ -761,12 +762,12 @@ async function sendMakerSuiteRequest(request, response) {
             const responseContent = candidates[0].content ?? candidates[0].output;
             const functionCall = (candidates?.[0]?.content?.parts ?? []).some(part => part.functionCall);
             const inlineData = (candidates?.[0]?.content?.parts ?? []).some(part => part.inlineData);
-            if (!progress) console.debug(`${apiName} response:`, util.inspect(generateResponseJson, { depth: 5, colors: true }));
+            if (!progress) console.debug(`${apiName} response:`, util.inspect(logDetails[0], { depth: 5, colors: true }));
 
             const responseText = typeof responseContent === 'string' ? responseContent : responseContent?.parts?.filter(part => !part.thought)?.map(part => part.text)?.join('\n\n');
             if (!responseText && !functionCall && !inlineData) {
                 let message = `${apiName} Candidate text empty`;
-                console.warn(message, ...warningDetails);
+                console.warn(message, ...logDetails);
                 progress?.finish('failed');
                 return response.send({ error: { message } });
             }
