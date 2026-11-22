@@ -692,6 +692,8 @@
     "Miscellaneous": "杂项",
     "Open Picture-in-Picture when switching away": "切到后台时自动打开画中画",
     "Open Picture-in-Picture now": "立即打开画中画",
+    "Requesting Picture-in-Picture. If no window appears, tap again to retry.": "正在请求画中画。如果没有出现小窗，可再次点击重试。",
+    "The browser accepted the Picture-in-Picture request.": "浏览器已接受画中画请求。",
     "Picture-in-Picture is unavailable in this browser or is disabled for this site.": "当前浏览器不支持画中画，或已为此网站禁用画中画。",
     "To use Picture-in-Picture, open SillyTavern over HTTPS or use localhost on the device running it.": "要使用画中画，请通过 HTTPS 访问酒馆，或在运行酒馆服务端的设备上通过 localhost 访问。",
     "Your browser blocked automatic Picture-in-Picture. Before switching away, use “Open Picture-in-Picture now” in User Settings → Miscellaneous.": "浏览器阻止了自动画中画。下次切到后台前，可在“用户设置 → 杂项”点击“立即打开画中画”。",

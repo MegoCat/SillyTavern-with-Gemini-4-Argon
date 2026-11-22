@@ -4,14 +4,17 @@ import { accountStorage } from './util/AccountStorage.js';
 export function initBackgroundPictureInPicture() {
     const documentPip = window.top === window && typeof window.documentPictureInPicture?.requestWindow === 'function'
         ? window.documentPictureInPicture : undefined;
-    const video = document.createElement('video');
+    let video = document.createElement('video');
     const standardVideo = document.pictureInPictureEnabled && typeof video.requestPictureInPicture === 'function';
-    if (!documentPip && !standardVideo && typeof video.webkitSetPresentationMode !== 'function') {
-        const status = document.getElementById('background_pip_status');
-        status.textContent = window.isSecureContext
-            ? t`Picture-in-Picture is unavailable in this browser or is disabled for this site.`
-            : t`To use Picture-in-Picture, open SillyTavern over HTTPS or use localhost on the device running it.`;
+    const status = document.getElementById('background_pip_status');
+    function showStatus(message) {
+        status.textContent = message;
         status.hidden = false;
+    }
+    if (!documentPip && !standardVideo && typeof video.webkitSetPresentationMode !== 'function') {
+        showStatus(window.isSecureContext
+            ? t`Picture-in-Picture is unavailable in this browser or is disabled for this site.`
+            : t`To use Picture-in-Picture, open SillyTavern over HTTPS or use localhost on the device running it.`);
         return;
     }
 
@@ -30,27 +33,51 @@ export function initBackgroundPictureInPicture() {
     let hintShown = false;
 
     let metadataReady;
+    let nextVideo = null;
     if (!documentPip) {
-        // Preload a real video track so mobile browsers can enter PiP within the click handler.
-        metadataReady = new Promise(resolve => {
-            video.addEventListener('loadedmetadata', resolve, { once: true });
-            video.addEventListener('error', resolve, { once: true });
-        });
-        video.hidden = true;
-        video.muted = true;
-        video.playsInline = true;
-        video.loop = true;
-        video.preload = 'auto';
-        video.src = '/img/picture-in-picture.mp4';
+        metadataReady = prepareVideo(video);
         document.body.append(video);
-        video.addEventListener('leavepictureinpicture', onVideoLeave);
-        video.addEventListener('webkitpresentationmodechanged', () => {
-            if (video.webkitPresentationMode !== 'picture-in-picture') onVideoLeave();
+    }
+
+    function prepareVideo(player) {
+        const ready = new Promise(resolve => {
+            player.addEventListener('loadedmetadata', resolve, { once: true });
+            player.addEventListener('error', resolve, { once: true });
+            player.addEventListener('abort', resolve, { once: true });
+        });
+        player.hidden = true;
+        player.muted = true;
+        player.playsInline = true;
+        player.loop = true;
+        player.preload = 'metadata';
+        player.src = '/img/picture-in-picture.mp4';
+        player.addEventListener('leavepictureinpicture', () => {
+            if (player === video) onVideoLeave();
+        });
+        player.addEventListener('webkitpresentationmodechanged', () => {
+            if (player !== video) return;
+            if (player.webkitPresentationMode !== 'picture-in-picture') onVideoLeave();
             else {
                 if (opening?.waitingForVideoMode) opening = null;
                 if (!requestedBy) closeWindow();
             }
         });
+        return ready;
+    }
+
+    function replaceVideo() {
+        const previous = video;
+        const needsExit = document.pictureInPictureElement === previous && !videoExit;
+        video = nextVideo.player;
+        metadataReady = nextVideo.ready;
+        nextVideo = null;
+        opening = null;
+        videoExit = null;
+        if (needsExit) document.exitPictureInPicture().catch(error => console.debug('Could not close previous Picture-in-Picture', error));
+        previous.replaceWith(video);
+        previous.pause();
+        previous.removeAttribute('src');
+        previous.load();
     }
 
     function videoIsOpen() {
@@ -69,13 +96,16 @@ export function initBackgroundPictureInPicture() {
         if (videoExit) finishVideoExit(videoExit);
         else if (!opening) {
             requestedBy = null;
+            status.hidden = true;
             video.pause();
+            if (nextVideo) replaceVideo();
         }
     }
 
     async function closeWindow() {
         requestedBy = null;
         opening = null;
+        status.hidden = true;
         if (documentPip) {
             const win = pipWindow;
             pipWindow = null;
@@ -100,12 +130,22 @@ export function initBackgroundPictureInPicture() {
     }
 
     async function openWindow(source = 'automatic') {
-        if (!pageActive || (source === 'automatic' && !automatic.checked)) return;
+        if (source === 'automatic' && (!pageActive || !automatic.checked)) return;
+        if (source === 'manual') {
+            if (documentPip && (opening || pipWindow)) closeWindow();
+            // Chrome can keep the old player as its PiP element after Android has dismissed the activity.
+            // Requesting PiP for that same element only returns the old session.
+            if (nextVideo) replaceVideo();
+            showStatus(t`Requesting Picture-in-Picture. If no window appears, tap again to retry.`);
+        }
         if (source === 'manual' || !requestedBy) requestedBy = source;
         if (opening && (source === 'automatic' || !opening.waitingForVideoMode)) return;
         // Chromium can keep returning the previous window after close(). Only our live window satisfies a click.
-        if ((pipWindow && !pipWindow.closed) || videoIsOpen()) return;
-        if (source === 'automatic' && (document.pictureInPictureElement || (documentPip?.window && !documentPip.window.closed))) return;
+        if ((pipWindow && !pipWindow.closed) || videoIsOpen()) {
+            if (source === 'manual' && !videoExit) showStatus(t`The browser accepted the Picture-in-Picture request.`);
+            return;
+        }
+        if (source === 'automatic' && (document.pictureInPictureElement?.isConnected || (documentPip?.window && !documentPip.window.closed))) return;
         // Once the old video has left PiP, use this click's activation even if exitPictureInPicture() is still pending.
         videoExit = null;
         const attempt = { waitingForVideoMode: false };
@@ -122,6 +162,7 @@ export function initBackgroundPictureInPicture() {
                     if (pipWindow === win) {
                         pipWindow = null;
                         requestedBy = null;
+                        status.hidden = true;
                     }
                 }, { once: true });
                 const doc = win.document;
@@ -133,12 +174,22 @@ export function initBackgroundPictureInPicture() {
                 logo.style.height = '62vh';
                 doc.body.append(logo);
             } else {
+                const player = video;
+                if (standardVideo && !nextVideo) {
+                    // Keep one paused player with metadata ready for the next tap's user activation.
+                    const next = document.createElement('video');
+                    nextVideo = { player: next, ready: prepareVideo(next) };
+                }
                 // Hidden tabs may defer play() until PiP opens. Only the video metadata is required.
-                video.play().catch(error => console.debug('Picture-in-Picture playback', error));
-                if (video.readyState === video.HAVE_NOTHING) await metadataReady;
+                player.play().catch(error => console.debug('Picture-in-Picture playback', error));
+                if (player.readyState === player.HAVE_NOTHING) await metadataReady;
                 if (opening !== attempt) return;
                 if (standardVideo) {
-                    await video.requestPictureInPicture();
+                    await player.requestPictureInPicture();
+                    if (player !== video) {
+                        if (document.pictureInPictureElement === player) await document.exitPictureInPicture();
+                        return;
+                    }
                 } else if (video.webkitSupportsPresentationMode?.('picture-in-picture') !== false) {
                     video.webkitSetPresentationMode('picture-in-picture');
                     attempt.waitingForVideoMode = !videoIsOpen();
@@ -147,13 +198,19 @@ export function initBackgroundPictureInPicture() {
                 }
                 if (!requestedBy) await closeWindow();
             }
-            if (opening === attempt) automaticBlocked = false;
+            if (opening === attempt) {
+                automaticBlocked = false;
+                if (source === 'manual') showStatus(t`The browser accepted the Picture-in-Picture request.`);
+            }
         } catch (error) {
             if (opening !== attempt) return;
             if (!documentPip) video.pause();
             console.debug('Could not open Picture-in-Picture', error);
-            if (requestedBy === 'manual') toastr.warning(t`Picture-in-Picture could not open. Check whether your browser allows it for this site.`);
-            else automaticBlocked = true;
+            if (requestedBy === 'manual') {
+                showStatus(t`Picture-in-Picture could not open. Check whether your browser allows it for this site.`);
+            } else {
+                automaticBlocked = true;
+            }
             requestedBy = null;
         } finally {
             if (opening === attempt && !attempt.waitingForVideoMode) opening = null;
@@ -181,7 +238,6 @@ export function initBackgroundPictureInPicture() {
             openWindow();
             return;
         }
-        closeWindow();
         if (automaticBlocked && !hintShown) {
             hintShown = true;
             toastr.info(t`Your browser blocked automatic Picture-in-Picture. Before switching away, use “Open Picture-in-Picture now” in User Settings → Miscellaneous.`);

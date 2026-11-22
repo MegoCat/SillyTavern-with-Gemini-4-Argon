@@ -22,7 +22,7 @@ test.beforeEach(async ({ page }) => {
     await page.route('**/api/settings/save', route => route.fulfill({ json: { ok: true } }));
 });
 
-test('coalesces tab and media requests and closes a window granted after returning', async ({ page }) => {
+test('keeps the same document PiP window across foreground returns, including a late grant', async ({ page }) => {
     await page.addInitScript(() => {
         const pip = {
             window: null,
@@ -54,17 +54,17 @@ test('coalesces tab and media requests and closes a window granted after returni
     expect(await page.evaluate(() => window.documentPictureInPicture.requests)).toBe(1);
     await setHidden(page, false);
     await page.evaluate(() => window.documentPictureInPicture.grant());
-    expect(await page.evaluate(() => window.documentPictureInPicture.window)).toBeNull();
+    expect(await page.evaluate(() => window.documentPictureInPicture.window.document.title)).toBe('SillyTavern');
 
     await setHidden(page, true);
-    await page.evaluate(() => window.documentPictureInPicture.grant());
-    expect(await page.evaluate(() => window.documentPictureInPicture.window.document.title)).toBe('SillyTavern');
     await setHidden(page, false);
-    expect(await page.evaluate(() => window.documentPictureInPicture.window)).toBeNull();
+    expect(await page.evaluate(() => window.documentPictureInPicture.requests)).toBe(1);
+    expect(await page.evaluate(() => window.documentPictureInPicture.window.document.title)).toBe('SillyTavern');
 
     await page.evaluate(() => document.getElementById('background_pip_auto').click());
+    expect(await page.evaluate(() => window.documentPictureInPicture.window)).toBeNull();
     await setHidden(page, true);
-    expect(await page.evaluate(() => window.documentPictureInPicture.requests)).toBe(2);
+    expect(await page.evaluate(() => window.documentPictureInPicture.requests)).toBe(1);
     expect(await page.evaluate(() => navigator.mediaSession.enter)).toBeNull();
 
     await setHidden(page, false);
@@ -103,18 +103,20 @@ test('a foreground click reopens document PiP while the browser still reports th
     await setHidden(page, true);
     await setHidden(page, false);
     const oldWindow = await page.evaluateHandle(() => window.documentPictureInPicture.window);
-    expect(await oldWindow.evaluate(win => win.closed)).toBe(true);
+    expect(await oldWindow.evaluate(win => win.closed)).toBe(false);
+    await oldWindow.evaluate(win => win.close());
     await button.click();
     expect(await page.evaluate(() => window.documentPictureInPicture.requests)).toBe(2);
     await oldWindow.evaluate(win => win.dispatchEvent(new Event('pagehide')));
     await setHidden(page, true);
     await setHidden(page, false);
-    expect(await page.evaluate(() => window.documentPictureInPicture.window.closed)).toBe(true);
+    expect(await page.evaluate(() => window.documentPictureInPicture.window.closed)).toBe(false);
+    await page.evaluate(() => window.documentPictureInPicture.window.close());
     await button.click();
     expect(await page.evaluate(() => window.documentPictureInPicture.requests)).toBe(3);
 });
 
-test('a denied background video request can be opened by a click, and pauses on return', async ({ page }) => {
+test('a manual video window stays open and playing on return after an automatic request was denied', async ({ page }) => {
     await page.addInitScript(() => {
         let active = null;
         let needsClick = true;
@@ -142,16 +144,15 @@ test('a denied background video request can be opened by a click, and pauses on 
     expect(await video.evaluate(el => document.pictureInPictureElement === el)).toBe(true);
     await setHidden(page, true);
     await setHidden(page, false);
-    await setHidden(page, true);
-    await page.evaluate(() => window.finishVideoExit());
     await expect.poll(() => video.evaluate(el => document.pictureInPictureElement === el && !el.paused)).toBe(true);
-    await setHidden(page, false);
+    expect(await page.evaluate(() => typeof window.finishVideoExit)).toBe('undefined');
+    await page.locator('#background_pip_auto').uncheck();
     await page.evaluate(() => window.finishVideoExit());
     expect(await video.evaluate(el => el.paused && !document.pictureInPictureElement)).toBe(true);
 });
 
 for (const { api, requestsBeforeExit } of [{ api: 'standard', requestsBeforeExit: 2 }, { api: 'webkit', requestsBeforeExit: 1 }]) {
-    test(`reopens ${api} video PiP across a delayed exit on return`, async ({ page }) => {
+    test(`reopens ${api} video PiP across a delayed exit after disabling the setting`, async ({ page }) => {
         await page.addInitScript(api => {
             let active = null;
             const state = { opens: 0, finishExit: null };
@@ -194,8 +195,7 @@ for (const { api, requestsBeforeExit } of [{ api: 'standard', requestsBeforeExit
         const button = page.locator('#background_pip_open');
         await button.click();
         await expect.poll(() => page.evaluate(() => window.pipTest.opens)).toBe(1);
-        await setHidden(page, true);
-        await setHidden(page, false);
+        await page.locator('#background_pip_auto').uncheck();
         await button.click();
         expect(await page.evaluate(() => window.pipTest.opens)).toBe(requestsBeforeExit);
         await page.evaluate(() => window.pipTest.finishExit());
@@ -203,6 +203,52 @@ for (const { api, requestsBeforeExit } of [{ api: 'standard', requestsBeforeExit
         await expect.poll(() => page.locator('video[src="/img/picture-in-picture.mp4"]').evaluate(el => el.paused)).toBe(false);
     });
 }
+
+test('another tap starts a new video PiP session even when Chrome still reports the previous player', async ({ page }) => {
+    await page.addInitScript(() => {
+        let active = null;
+        const opened = [];
+        const exits = [];
+        const state = { visible: false, opened, finishExits() { exits.splice(0).forEach(finish => finish()); } };
+        Object.defineProperty(window, 'documentPictureInPicture', { value: undefined });
+        Object.defineProperty(document, 'pictureInPictureEnabled', { value: true });
+        Object.defineProperty(document, 'pictureInPictureElement', { get: () => active });
+        HTMLVideoElement.prototype.requestPictureInPicture = async function () {
+            // A request for the same player returns its existing PiP window.
+            if (active !== this) {
+                opened.push(this);
+                state.visible = true;
+            }
+            active = this;
+        };
+        document.exitPictureInPicture = () => new Promise(resolve => {
+            const leaving = active;
+            exits.push(() => {
+                if (active === leaving) active = null;
+                leaving.dispatchEvent(new Event('leavepictureinpicture'));
+                resolve();
+            });
+        });
+        window.pipTest = state;
+    });
+    await openSettingsDrawer(page, '#user-settings-button');
+    const button = page.locator('#background_pip_open');
+    await button.click();
+    await expect.poll(() => page.evaluate(() => window.pipTest.opened.length)).toBe(1);
+    for (const count of [2, 3]) {
+        await setHidden(page, true);
+        await setHidden(page, false);
+        expect(await page.evaluate(() => window.pipTest.visible)).toBe(true);
+        // Android has dismissed its native window but the DOM still points to the old player.
+        await page.evaluate(() => { window.pipTest.visible = false; });
+        await button.click();
+        await expect.poll(() => page.evaluate(() => window.pipTest.opened.length)).toBe(count);
+        await page.evaluate(() => window.pipTest.finishExits());
+        expect(await page.evaluate(() => window.pipTest.visible)).toBe(true);
+        expect(await page.evaluate(() => document.pictureInPictureElement === window.pipTest.opened.at(-1))).toBe(true);
+        expect(await page.evaluate(() => window.pipTest.opened.slice(0, -1).every(video => video.paused && !video.isConnected))).toBe(true);
+    }
+});
 
 for (const { secure, reason } of [
     { secure: true, reason: 'Picture-in-Picture is unavailable in this browser or is disabled for this site.' },
